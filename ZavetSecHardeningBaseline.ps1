@@ -311,8 +311,11 @@ if ($isRollback) {
 
             # SYS-003: Firewall profiles
             if ($id -eq 'SYS-003') {
-                foreach ($pf in $bkv) {
-                    Set-NetFirewallProfile -Name $pf.Name -Enabled $pf.Enabled -EA SilentlyContinue
+                $pfList = @($bkv)
+                foreach ($pf in $pfList) {
+                    if ($pf -and $pf.PSObject.Properties['Name']) {
+                        Set-NetFirewallProfile -Name $pf.Name -Enabled $pf.Enabled -EA SilentlyContinue
+                    }
                 }
                 Write-Pass "Firewall profiles restored"
                 $bkCount++; continue
@@ -1139,15 +1142,19 @@ Test-And-Set -ID 'SYS-003' -Category 'System' -Severity 'CRITICAL' `
     -CheckScript {
         $profiles = Get-NetFirewallProfile -EA SilentlyContinue
         if (-not $profiles) { return $false }
-        return ($profiles | Where-Object { $_.Enabled -eq $false }).Count -eq 0
+        $profileList = @($profiles)
+        if ($profileList.Count -eq 0) { return $false }
+        $disabled = @($profileList | Where-Object { $_.Enabled -eq $false })
+        return $disabled.Count -eq 0
     } `
     -BackupScript {
-        $p = Get-NetFirewallProfile -EA SilentlyContinue | Select-Object Name,Enabled
-        return $p
+        $p = Get-NetFirewallProfile -EA SilentlyContinue
+        if ($p) { return @($p | Select-Object Name,Enabled) }
+        return @()
     } `
     -ApplyScript {
+        # Try via cmdlet first, fall back to netsh (works even when third-party firewall is active)
         Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -EA SilentlyContinue
-        # Also via netsh as fallback
         & netsh advfirewall set allprofiles state on 2>&1 | Out-Null
     }
 
