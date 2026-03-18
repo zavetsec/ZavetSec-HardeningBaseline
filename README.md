@@ -30,86 +30,85 @@ that fill in hours. These are not edge cases — they are defaults.
 
 `ZavetSecHardeningBaseline` fixes this. It audits your current state, applies
 a hardened baseline aligned to **CIS Benchmark**, **DISA STIG**, and
-**Microsoft Security Baseline**, and generates a signed HTML report you can
-hand to a customer or attach to a ticket. If something breaks, rollback from
-the JSON backup created before every change.
+**Microsoft Security Baseline**, and generates an HTML report you can hand to
+a customer or attach to a ticket. If something breaks, rollback from the JSON
+backup created before every change.
 
 ---
 
-## `>_ files`
+## `>_ how it works`
 
 ```
-ZavetSecHardeningBaseline.ps1   — main script (PowerShell 5.1+)
-Run-Hardening.bat               — interactive launcher with menu
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │   Audit mode        Read current state                  │
+  │       │                    │                            │
+  │       ▼                    ▼                            │
+  │   State detection   HTML report generated               │
+  │       │                                                 │
+  │   Apply mode        JSON backup → apply changes         │
+  │       │                    │                            │
+  │       ▼                    ▼                            │
+  │   Change engine     Verify each setting post-apply      │
+  │       │                                                 │
+  │   Rollback mode     Read backup → restore prior state   │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
 ```
 
----
-
-## `>_ design philosophy`
-
-**Idempotent.** Run Apply twice — result is identical. Safe for scheduled tasks
-and re-deployment after GPO conflicts.
-
-**Non-destructive by default.** Every Apply creates a timestamped JSON backup
-of prior state. Rollback is a single command.
-
-**Audit-first.** Audit mode makes zero changes. Run it first, read the report,
-then decide what to apply.
-
-**PsExec-compatible.** `-NonInteractive` flag suppresses all prompts. Deploy
-across a subnet without touching keyboards.
-
-**Locale-independent.** Audit policy is configured via auditpol GUIDs, not
-subcategory names. Works identically on Russian, English, and any other
-Windows localization.
+**Idempotent** — run Apply twice, result is identical.
+**Non-destructive** — backup created before every change, full rollback available.
+**Locale-independent** — audit policy uses GUIDs, not subcategory names. Works on
+any Windows language.
+**PsExec-compatible** — `-NonInteractive` suppresses all prompts for remote deployment.
 
 ---
 
 ## `>_ what attacks does this stop`
 
-| Threat | Technique | Controls applied |
+| Threat | MITRE | Controls |
 |---|---|---|
-| Responder / MITM | T1557.001 | LLMNR off, NBT-NS off, mDNS off, WPAD off, SMB signing required |
-| Mimikatz / credential dump | T1003.001 | WDigest off, LSA PPL on, Credential Guard enabled |
-| Pass-the-Hash | T1550.002 | NTLMv2 only, LM hash storage disabled, 128-bit session security |
-| EternalBlue / WannaCry | T1210 | SMBv1 disabled on server and client driver |
-| Lateral movement | T1021 | Remote Registry disabled, anonymous enumeration restricted |
-| Pre-auth RDP exploits | T1021.001 | NLA enforced, encryption level high |
-| USB payload delivery | T1091 | AutoRun / AutoPlay fully disabled |
-| PowerShell living-off-land | T1059.001 | Script Block + Module logging, PSv2 disabled, Exec Policy set |
-| Log gap / blind spot | — | Security log 1 GB, 27 audit subcategories configured |
+| Responder / MITM | T1557.001 | LLMNR, NBT-NS, mDNS, WPAD disabled · SMB signing required |
+| Mimikatz / LSASS dump | T1003.001 | WDigest off · LSA PPL on · Credential Guard enabled |
+| Pass-the-Hash | T1550.002 | NTLMv2 only · LM hash storage off · 128-bit session |
+| EternalBlue / WannaCry | T1210 | SMBv1 disabled — server and client driver |
+| Lateral movement | T1021 | Remote Registry off · anonymous enumeration restricted |
+| Pre-auth RDP exploits | T1021.001 | NLA enforced · encryption level high |
+| USB payload delivery | T1091 | AutoRun / AutoPlay disabled on all drive types |
+| PowerShell abuse | T1059.001 | Script Block + Module logging · PSv2 disabled |
+| Logging blind spot | — | Security log 1 GB · 27 audit subcategories configured |
 
 ---
 
 ## `>_ coverage`
 
-**Network** `NET-001 — NET-010`
-Disables LLMNR, mDNS, WPAD, NBT-NS, LMHOSTS. Disables SMBv1 on both server
-and client driver. Enforces SMB signing. Restricts anonymous SAM/share
-enumeration. Disables Remote Registry.
+### 🌐 Network surface reduction
+LLMNR, mDNS, WPAD, NBT-NS, LMHOSTS disabled. SMBv1 off on server and client
+driver. SMB signing required on both sides. Anonymous SAM/share enumeration
+blocked. Remote Registry disabled. `NET-001 — NET-010`
 
-**Credential Protection** `CRED-001 — CRED-006`
-Disables WDigest plaintext caching. Enables LSA Protected Process Light.
-Enables Credential Guard (VBS). Forces NTLMv2. Disables LM hash storage.
-Requires 128-bit NTLM session security.
+### 🔑 Credential protection
+WDigest plaintext caching off. LSA Protected Process Light enabled. Credential
+Guard (VBS) enabled. NTLMv2 only — LM and NTLMv1 refused. LM hash storage
+disabled. 128-bit NTLM session security enforced. `CRED-001 — CRED-006`
 
-**PowerShell Hardening** `PS-001 — PS-005`
-Enables Script Block Logging (4104) and Module Logging (4103). Enables
-transcription to `C:\ProgramData\PSTranscripts`. Disables the PSv2 engine
-(AMSI bypass vector). Sets Execution Policy at machine scope.
+### 🐚 PowerShell hardening
+Script Block Logging (4104) and Module Logging (4103) enabled. Transcription
+to `C:\ProgramData\PSTranscripts`. PSv2 engine disabled — closes the
+`powershell -version 2` AMSI bypass. Execution Policy set at machine scope.
+`PS-001 — PS-005`
 
-**Audit Policy** `AUD-001 — AUD-027`
-27 subcategories via `auditpol` with GUID references — locale-independent.
-Covers Logon/Logoff, Kerberos, Process Creation, Account Management, Object
-Access, Privilege Use, Policy Change, DPAPI, Scheduled Tasks, Removable
-Storage, and Firewall events.
+### 📋 Audit policy
+27 subcategories via `auditpol` with GUID references. Covers Logon/Logoff,
+Kerberos (TGT + TGS), Process Creation, Account Management, Object Access,
+Privilege Use, Policy Change, DPAPI, Scheduled Tasks, Removable Storage,
+Firewall events. `AUD-001 — AUD-027`
 
-**System Hardening** `SYS-001 — SYS-010`
-Enables UAC with full secure desktop enforcement. Disables AutoRun/AutoPlay.
-Enables Windows Firewall on all profiles. Requires RDP NLA. Enables DEP
-(AlwaysOn). Sets Security log to 1 GB with overwrite retention (no archive
-files). Enables DoH policy. Sets RDP encryption to High. Optionally disables
-Print Spooler (PrintNightmare mitigation).
+### 🖥️ System hardening
+UAC full enforcement with secure desktop. AutoRun/AutoPlay disabled. Firewall
+on all profiles. RDP NLA required. DEP AlwaysOn. Security log 1 GB / overwrite.
+DoH policy. RDP encryption high. Print Spooler disable opt-in (PrintNightmare).
+`SYS-001 — SYS-010`
 
 ---
 
@@ -119,27 +118,25 @@ Print Spooler (PrintNightmare mitigation).
 
 **What may break:**
 
-- **SMBv1 disable** — legacy devices (old printers, NAS, XP/2003) that only
-  speak SMBv1 will lose network access. Audit first with `Get-SmbConnection`
-  to identify dependent devices.
-- **SMB signing required** — clients that do not support signing will be
-  rejected. Negligible in modern environments, significant in mixed/legacy ones.
-- **Credential Guard** — requires UEFI + Secure Boot + VBS-capable hardware.
-  Silently skipped on incompatible hardware, but verify before deploying on
-  older servers.
-- **NTLMv2 only** — legacy systems that only support LM/NTLMv1 will fail
-  authentication. Rare, but exists in some OT/industrial environments.
-- **Print Spooler disable** (`-EnablePrintSpoolerDisable`) — printing stops.
-  Apply only to servers and workstations that do not print.
-- **PSv2 disable** — requires a reboot. Some older automation scripts
-  that explicitly call `powershell -version 2` will break.
+- **SMBv1 disable** — legacy devices that only speak SMBv1 (old printers, NAS,
+  XP/2003) lose network access. Run `Get-SmbConnection` first to identify
+  dependent devices.
+- **SMB signing required** — clients without signing support are rejected.
+  Negligible in modern environments, check in legacy/mixed estates.
+- **Credential Guard** — requires UEFI + Secure Boot + VBS hardware.
+  Skipped gracefully on incompatible machines.
+- **NTLMv2 only** — systems that only support LM/NTLMv1 fail authentication.
+  Rare in IT, more common in OT/industrial environments.
+- **Print Spooler** (`-EnablePrintSpoolerDisable`) — printing stops entirely.
+  Apply only to non-printing machines.
+- **PSv2 disable** — requires reboot. Automation calling `powershell -version 2`
+  will break.
 
-**What never breaks:**
-Audit mode is fully read-only. Rollback restores prior registry state
-from the JSON backup. Services are restored to their original startup type.
+**Reboot required for:** Credential Guard · DEP AlwaysOn · PSv2 disable · SMBv1 client driver.
 
-**Reboot required for:** Credential Guard, DEP (AlwaysOn), PSv2 disable,
-SMBv1 client driver.
+**Apply runtime:** ~20–60 seconds on a modern workstation. Audit mode is faster.
+Audit policy configuration (27 subcategories via `auditpol`) accounts for most
+of the runtime on domain-joined machines.
 
 ---
 
@@ -160,16 +157,16 @@ Right-click `Run-Hardening.bat` → **Run as administrator.**
    [4]  EXIT
 ```
 
-Creates `Reports\` subfolder automatically. Timestamped HTML reports and JSON
-backups saved there. ROLLBACK lists available backups by number.
+Creates `Reports\` automatically. ROLLBACK lists backups by number — no path
+entry required.
 
 ### Option B — PowerShell directly
 
 ```powershell
-# Audit only — zero changes
+# Audit — zero changes
 .\ZavetSecHardeningBaseline.ps1 -Mode Audit
 
-# Apply (interactive confirmation)
+# Apply (interactive)
 .\ZavetSecHardeningBaseline.ps1 -Mode Apply
 
 # Apply — no prompts (PsExec / automation)
@@ -197,81 +194,65 @@ psexec \\TARGET -s -c .\ZavetSecHardeningBaseline.ps1 -Mode Apply -NonInteractiv
 
 ---
 
-## `>_ recommended deployment timeline`
+## `>_ deployment timeline`
 
 ```
-Day 0    Run Audit on a representative sample of machines.
-         Review the HTML report. Identify legacy dependencies
-         (SMBv1 users, NTLMv1 devices, old automation scripts).
+Day 0    Audit on a representative sample.
+         Review the report. Identify legacy dependencies
+         (SMBv1 devices, NTLMv1 systems, old automation).
 
-Day 1-7  Fix identified dependencies. Test Apply in a lab VM.
-         Verify rollback works from the generated backup.
+Day 1–7  Fix dependencies. Test Apply in a lab VM.
+         Confirm rollback works from the generated backup.
 
-Day 7    Apply to a pilot group (5-10 machines).
-         Monitor for 48h. Check application and helpdesk tickets.
+Day 7    Apply to a pilot group (5–10 machines).
+         Monitor for 48 hours. Check helpdesk tickets.
 
-Day 14   Apply to the broader environment in batches.
-         Reboot machines requiring it (Credential Guard, DEP, PSv2).
+Day 14+  Roll out in batches. Reboot machines that require it.
 
 Day 30   Re-run Audit across all machines.
          Compare compliance % before and after.
-         Attach HTML report to change management record.
+         Attach report to change management record.
 ```
 
 ---
 
 ## `>_ vs alternatives`
 
-| Tool | Approach | Rollback | Report | Offline | PS 5.1 |
-|---|---|---|---|---|---|
-| **ZavetSecHardeningBaseline** | Script, 3 modes | ✅ JSON backup | ✅ HTML | ✅ | ✅ |
-| CIS CAT Pro | GUI scanner | ❌ | ✅ | ❌ requires Java | ❌ |
-| LGPO.exe | GPO import | manual | ❌ | ✅ | N/A |
-| GPO baseline | Policy-based | via GPO restore | ❌ | ❌ needs DC | N/A |
-| Microsoft SCT | GPO + scripts | partial | ❌ | ✅ | partial |
+| Tool | Rollback | Report | Offline | PS 5.1 |
+|---|---|---|---|---|
+| **ZavetSecHardeningBaseline** | ✅ JSON backup | ✅ HTML | ✅ | ✅ |
+| CIS CAT Pro | ❌ | ✅ | ❌ requires Java | ❌ |
+| LGPO.exe | manual | ❌ | ✅ | N/A |
+| Microsoft SCT (GPO) | via GPO restore | ❌ | ✅ | partial |
 
 ---
 
 ## `>_ tested environments`
 
-| OS | Arch | Status |
+| OS | Domain | Workgroup |
 |---|---|---|
-| Windows 10 21H2+ | x64 | ✅ |
-| Windows 11 22H2+ | x64 | ✅ |
-| Windows Server 2016 | x64 | ✅ |
-| Windows Server 2019 | x64 | ✅ |
-| Windows Server 2022 | x64 | ✅ |
-| Windows Server Core | x64 | ✅ (no browser for report) |
-| Domain-joined | — | ✅ |
-| Workgroup | — | ✅ |
+| Windows 10 21H2+ | ✅ | ✅ |
+| Windows 11 22H2+ | ✅ | ✅ |
+| Windows Server 2016 | ✅ | ✅ |
+| Windows Server 2019 | ✅ | ✅ |
+| Windows Server 2022 | ✅ | ✅ |
+| Server Core | ✅ | ✅ |
 
 ---
 
 ## `>_ parameters`
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `-Mode` | `Audit\|Apply\|Rollback` | `Audit` | Operation mode |
-| `-BackupPath` | string | script dir | JSON backup path |
-| `-OutputPath` | string | script dir | HTML report path |
-| `-SkipAuditPolicy` | switch | — | Skip audit policy section |
-| `-SkipNetworkHardening` | switch | — | Skip network section |
-| `-SkipPowerShell` | switch | — | Skip PowerShell section |
-| `-SkipCredentialProtection` | switch | — | Skip credentials section |
-| `-EnablePrintSpoolerDisable` | switch | — | Disable Print Spooler (opt-in) |
-| `-NonInteractive` | switch | — | Suppress all prompts |
-
----
-
-## `>_ output`
-
-Every run produces a dark-themed, filterable **HTML report** containing:
-compliance score gauge, per-category breakdown, full check table with severity /
-MITRE reference / apply status / remediation command, and the rollback command
-pre-filled with the backup path.
-
-Reports are saved to `.\Reports\` when using the BAT launcher, or to the script
-directory when running PowerShell directly (override with `-OutputPath`).
+| Parameter | Default | Description |
+|---|---|---|
+| `-Mode Audit\|Apply\|Rollback` | `Audit` | Operation mode |
+| `-BackupPath` | script dir | JSON backup path |
+| `-OutputPath` | script dir | HTML report path |
+| `-SkipAuditPolicy` | — | Skip audit policy section |
+| `-SkipNetworkHardening` | — | Skip network section |
+| `-SkipPowerShell` | — | Skip PowerShell section |
+| `-SkipCredentialProtection` | — | Skip credentials section |
+| `-EnablePrintSpoolerDisable` | — | Disable Print Spooler (opt-in) |
+| `-NonInteractive` | — | Suppress all prompts |
 
 ---
 
