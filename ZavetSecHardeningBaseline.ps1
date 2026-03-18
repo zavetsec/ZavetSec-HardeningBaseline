@@ -1344,13 +1344,13 @@ function Get-SC { param([string]$s)
 $catGroups   = $global:Checks | Group-Object Category | Sort-Object Name
 $catBars     = ($catGroups | ForEach-Object {
     $grp      = $_
-    $pass     = ($grp.Group | Where-Object { $_.Compliant }).Count
-    $fail     = ($grp.Group | Where-Object { -not $_.Compliant }).Count
-    $total    = $grp.Count
-    $pct      = [Math]::Round($pass / [Math]::Max($total,1) * 100)
-    $barW     = [Math]::Round($pct * 1.2)
+    $pass     = [int]($grp.Group | Where-Object { $_.Compliant -eq $true  }).Count
+    $fail     = [int]($grp.Group | Where-Object { $_.Compliant -eq $false }).Count
+    $total    = [int]($pass + $fail)
+    $pct      = if ($total -gt 0) { [Math]::Round($pass / $total * 100) } else { 0 }
+    $barPct   = [Math]::Min($pct, 100)
     $clr      = if ($pct -ge 90) { '#30d158' } elseif ($pct -ge 60) { '#ffd60a' } else { '#ff6b00' }
-    "<tr><td style='color:#a78bfa;font-size:11px;white-space:nowrap'>$($grp.Name)</td><td style='color:#30d158'>$pass</td><td style='color:#ff6b00'>$fail</td><td><div style='background:#181828;border-radius:3px;height:6px;width:120px'><div style='background:$clr;height:6px;border-radius:3px;width:${barW}px'></div></div></td><td style='color:$clr;font-size:10px'>$pct%</td></tr>"
+    "<tr><td style='color:#a78bfa;font-size:11px;white-space:nowrap'>$($grp.Name)</td><td style='color:#30d158'>$pass</td><td style='color:#ff6b00'>$fail</td><td style='width:140px'><div style='background:#181828;border-radius:3px;height:6px;width:120px;overflow:hidden'><div style='background:$clr;height:6px;border-radius:3px;width:${barPct}%'></div></div></td><td style='color:$clr;font-size:10px'>$pct%</td></tr>"
 }) -join "`n"
 
 $tableRows = @(foreach ($c in ($global:Checks | Sort-Object @{e={if ($_.Compliant) {1} else {0}}},Severity)) {
@@ -1392,10 +1392,8 @@ $html = @"
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#07070e;color:#e2e2e8;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;line-height:1.6}
 header{background:linear-gradient(135deg,#07070e,#0c0c1a);border-bottom:1px solid #181828;padding:22px 40px;display:flex;align-items:center;gap:20px}
-.logo{font-size:24px;font-weight:800;color:#00d4ff;font-family:'Courier New',monospace;letter-spacing:-1px;white-space:nowrap}
-.logo span{color:#ff2d55}.logo em{color:#30d158;font-style:normal}
-.hi h1{font-size:16px;font-weight:600}
-.hi p{color:#6e6e80;font-size:11px;margin-top:3px}
+.hi h1{font-size:20px;font-weight:600}
+.hi p{color:#6e6e80;font-size:13px;margin-top:4px}
 .main{padding:26px 40px;max-width:1800px;margin:0 auto}
 .rb{background:#0e0e1a;border:2px solid #282838;border-radius:12px;padding:20px 28px;margin-bottom:22px;display:flex;align-items:center;gap:28px}
 .rl{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:1.2px}
@@ -1427,12 +1425,11 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
 </head>
 <body>
 <header>
-  <div class="logo">ZAVET<span>::</span><em>SEC</em></div>
   <div class="hi">
-    <h1>ZavetSecHardeningBaseline <span style="font-size:11px;color:#6e6e80;font-weight:400">v1.0</span></h1>
+    <h1>ZavetSecHardeningBaseline <span style="font-size:13px;color:#6e6e80;font-weight:400">v1.0</span></h1>
     <p>Windows Security Hardening Baseline &nbsp;|&nbsp; Host: $env:COMPUTERNAME &nbsp;|&nbsp; Mode: <span class="mode-badge" style="background:$modeColor">$Mode</span> &nbsp;|&nbsp; Run: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) &nbsp;|&nbsp; Duration: $duration &nbsp;|&nbsp; Checks: $totalChecks</p>
   </div>
-  <div style="margin-left:auto;text-align:right;font-size:10px;color:#6e6e80;font-family:'Courier New',monospace;line-height:1.8">
+  <div style="margin-left:auto;text-align:right;font-size:11px;color:#6e6e80;font-family:'Courier New',monospace;line-height:1.8">
     <div style="color:#00d4ff">ZavetSec</div>
     <div>github.com/zavetsec</div>
     <div>CIS | DISA STIG | MS Baseline</div>
