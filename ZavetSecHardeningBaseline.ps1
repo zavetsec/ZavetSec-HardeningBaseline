@@ -275,15 +275,49 @@ function Backup-RegValue {
 # -------------------------------------------------------
 if ($isRollback) {
     Write-Phase "ROLLBACK MODE"
-    if (-not (Test-Path $BackupPath)) {
-        Write-Err "Backup file not found: $BackupPath"
-        Write-Host "  Specify correct path: -BackupPath C:\path\to\backup.json" -ForegroundColor Yellow
+
+    # --- Interactive backup selection if path not given or not found ---
+    if ([string]::IsNullOrEmpty($BackupPath) -or -not (Test-Path $BackupPath)) {
         if (-not $NonInteractive) {
+            # Search for backup files in script directory
+            $backupFiles = @(Get-ChildItem -Path $PSScriptRoot -Filter 'HardeningBackup_*.json' -File |
+                             Sort-Object LastWriteTime -Descending)
+
+            if ($backupFiles.Count -eq 0) {
+                Write-Err "No backup files found in: $PSScriptRoot"
+                Write-Host "  Run '-Mode Apply' first to create a backup." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
+                $null = [Console]::ReadLine()
+                exit 1
+            }
+
             Write-Host ""
-            Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
-            $null = [Console]::ReadLine()
+            Write-Host "  Available backups (newest first):" -ForegroundColor Cyan
+            Write-Host ""
+            for ($i = 0; $i -lt $backupFiles.Count; $i++) {
+                $f = $backupFiles[$i]
+                Write-Host ("  [{0,2}]  {1}  [{2}]" -f ($i + 1), $f.Name, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Gray
+            }
+            Write-Host ""
+            Write-Host ("  Select backup [1-{0}]: " -f $backupFiles.Count) -ForegroundColor Yellow -NoNewline
+            $sel = [Console]::ReadLine()
+            $selIdx = 0
+            if (-not [int]::TryParse($sel.Trim(), [ref]$selIdx) -or $selIdx -lt 1 -or $selIdx -gt $backupFiles.Count) {
+                Write-Err "Invalid selection: $sel"
+                Write-Host ""
+                Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
+                $null = [Console]::ReadLine()
+                exit 1
+            }
+            $BackupPath = $backupFiles[$selIdx - 1].FullName
+            Write-Host ""
+            Write-Info "Selected: $BackupPath"
+        } else {
+            Write-Err "Backup file not found: $BackupPath"
+            Write-Host "  Specify correct path: -BackupPath C:\path\to\backup.json" -ForegroundColor Yellow
+            exit 1
         }
-        exit 1
     }
     $bkData  = Get-Content $BackupPath -Raw | ConvertFrom-Json
     $bkCount = 0

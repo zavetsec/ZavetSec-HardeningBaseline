@@ -19,13 +19,10 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Paths - use script directory for all output (avoids UAC/profile path issues)
+:: Paths - save all output next to the scripts (mirrors PS1 default: $PSScriptRoot)
 set "SCRIPT_DIR=%~dp0"
 set "PS_SCRIPT=%SCRIPT_DIR%ZavetSecHardeningBaseline.ps1"
-set "REPORT_DIR=%SCRIPT_DIR%Reports"
-
-:: Create Reports subfolder if not exists
-if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+set "REPORT_DIR=%SCRIPT_DIR%"
 
 :: Check PS script exists
 if not exist "%PS_SCRIPT%" (
@@ -44,7 +41,7 @@ echo  ============================================================
 echo   ZavetSec - Windows Security Hardening Baseline
 echo  ============================================================
 echo.
-echo   Reports saved to: %REPORT_DIR%
+echo   Output directory  : %SCRIPT_DIR%
 echo.
 echo   [1]  AUDIT    - Check current state (no changes)
 echo   [2]  APPLY    - Apply all hardening settings
@@ -82,7 +79,7 @@ if exist "%REPORT%" (
     if /i "!OPEN!"=="Y" start "" "%REPORT%"
 ) else (
     echo  [!!] Report NOT found at: %REPORT%
-    echo  [..] Files in Reports folder:
+    echo  [..] Files in output folder:
     dir /b "%REPORT_DIR%\" 2>nul || echo  (empty)
 )
 echo.
@@ -115,7 +112,7 @@ if exist "%REPORT%" (
     if /i "!OPEN!"=="Y" start "" "%REPORT%"
 ) else (
     echo  [!!] Report NOT found at: %REPORT%
-    echo  [..] Files in Reports folder:
+    echo  [..] Files in output folder:
     dir /b "%REPORT_DIR%\" 2>nul || echo  (empty)
 )
 echo.
@@ -127,27 +124,18 @@ goto MENU
 cls
 echo.
 echo  [>>] ROLLBACK - restores settings from backup file
-echo  [..] Searching for backups in:
-echo       %REPORT_DIR%  (via launcher)
-echo       %SCRIPT_DIR%  (via PowerShell direct)
+echo  [..] Searching for backups in: %SCRIPT_DIR%
 echo.
 
-:: Build numbered list of backup files (search Reports\ AND script root dir)
+:: Build numbered list of backup files from script directory
 set "IDX=0"
-for %%F in ("%REPORT_DIR%\HardeningBackup_*.json") do (
-    set /a IDX+=1
-    set "BACKUP_!IDX!=%%~fF"
-    echo   [!IDX!]  %%~nxF  [Reports\]
-)
 for %%F in ("%SCRIPT_DIR%HardeningBackup_*.json") do (
     set /a IDX+=1
     set "BACKUP_!IDX!=%%~fF"
-    echo   [!IDX!]  %%~nxF  [script dir]
+    echo   [!IDX!]  %%~nxF
 )
 if %IDX%==0 (
-    echo  [!!] No backup files found in:
-    echo       %REPORT_DIR%
-    echo       %SCRIPT_DIR%
+    echo  [!!] No backup files found in: %SCRIPT_DIR%
     echo.
     pause & goto MENU
 )
