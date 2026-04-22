@@ -387,7 +387,7 @@ Two recovery paths are available — from the interactive menu `[4] Defaults` or
 # Path 2 -- full reset to Windows out-of-box defaults (when backup unavailable)
 .\ZavetSec-Harden.ps1 -Mode Defaults
 # or directly:
-.\ZavetSecWindowsDefaults.ps1 -NonInteractive
+.\WindowsDefaults.ps1 -NonInteractive
 ```
 
 **Decision tree:**
