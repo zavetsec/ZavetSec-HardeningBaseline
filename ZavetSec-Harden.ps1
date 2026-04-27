@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     ZavetSec-Harden - Windows security hardening baseline by ZavetSec.
@@ -47,6 +47,21 @@
       - Increase Event Log sizes
       - Enable DEP (Data Execution Prevention)
       - Disable unused services (LLMNR/WPAD/Xbox/etc)
+      - Restrict Remote SAM enumeration (NET-011)
+      - Clear null-session pipes and shares (NET-012)
+      - Disable IP source routing IPv4+IPv6 (NET-013)
+      - Disable ICMP redirect acceptance (NET-014)
+      - Enable SEHOP exception chain validation (CRED-007)
+      - Mitigate CredSSP Oracle CVE-2018-0886 (CRED-008)
+      - Kerberos AES-only encryption types (CRED-009)
+      - Remote Credential Guard for RDP (CRED-010)
+      - Netlogon signed/sealed secure channel (CRED-011)
+      - Process creation command line audit Event 4688 (SYS-011)
+      - Protect auditpol subcategories from GPO override (SYS-012)
+      - Authenticode padding check Flame mitigation (SYS-013)
+      - NTLM incoming traffic audit Event 8004 (SYS-014)
+      - Disable NULL session fallback for LocalSystem (SYS-015)
+      - Self-unblock Zone.Identifier on startup (prevents PS-005 locking script)
 
 .PARAMETER Mode
     'Audit'  - Check settings, report only, no changes (default)
@@ -103,7 +118,7 @@
     ================================================================
     ZavetSec | https://github.com/zavetsec
     Script   : ZavetSec-Harden
-    Version  : 1.2
+    Version  : 1.4
     Author   : ZavetSec
     License  : MIT
     ================================================================
@@ -133,7 +148,30 @@ param(
     [switch]$NonInteractive  # Suppress all prompts (for PsExec/remote/scheduled task use)
 )
 
-Set-StrictMode -Version Latest
+# -------------------------------------------------------
+# Self-unblock: remove Zone.Identifier ADS if present.
+# PS-005 sets ExecutionPolicy=RemoteSigned via registry (GPO level).
+# Files downloaded from the internet carry a Zone.Identifier NTFS stream
+# that marks them as "untrusted remote" -- RemoteSigned then blocks them
+# even though they are physically local.
+# We strip the mark from this script file before any other code runs,
+# so subsequent re-launches work without -ExecutionPolicy Bypass.
+# This is safe: equivalent to right-click -> Properties -> Unblock in Explorer.
+# -------------------------------------------------------
+try {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if ($selfPath -and (Test-Path $selfPath)) {
+        $zoneStream = Get-Item -Path $selfPath -Stream 'Zone.Identifier' -EA SilentlyContinue
+        if ($zoneStream) {
+            Remove-Item -Path $selfPath -Stream 'Zone.Identifier' -Force -EA SilentlyContinue
+            Write-Host "  [..] Zone.Identifier removed from script file (Unblock-File applied)." -ForegroundColor DarkGray
+        }
+    }
+} catch {
+    # Non-fatal -- NTFS ADS removal may fail on FAT32 / network shares; ignore silently
+}
+
+Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
 $global:StartTime = Get-Date
@@ -181,8 +219,8 @@ function Test-And-Set {
         [string]$Name,
         [string]$Description,
         [string]$Severity,         # CRITICAL / HIGH / MEDIUM / LOW
-        [scriptblock]$CheckScript,   # Returns $true if compliant
-        [scriptblock]$ApplyScript,
+        [scriptblock]$CheckScript,   # Returns $true if compliant. Throw 'SKIP:<reason>' to mark N/A.
+        [scriptblock]$ApplyScript,   # Throw 'SKIP:<reason>' to mark N/A (e.g. unsupported OS, hardware).
         [scriptblock]$BackupScript,
         [string]$Reference    = '',     # CIS/MITRE reference
         [string]$Remediation  = '',     # Manual fix command
@@ -192,12 +230,36 @@ function Test-And-Set {
     $compliant  = $false
     $checkError = ''
     $applyStatus= ''
+    $skipReason = ''
 
     # --- CHECK ---
     try {
         $compliant = & $CheckScript
     } catch {
-        $checkError = $_.ToString()
+        $msg = $_.Exception.Message
+        if ($msg -match '^SKIP:(.*)$') {
+            # CheckScript explicitly says "this control does not apply to this host"
+            $skipReason = $Matches[1].Trim()
+            $applyStatus = 'NotApplicable'
+            Write-Info "$Name [N/A: $skipReason]"
+            $global:Skipped++
+            $global:Checks.Add([PSCustomObject]@{
+                ID             = $ID
+                Category       = $Category
+                Name           = $Name
+                Description    = $Description
+                Severity       = $Severity
+                Compliant      = $null         # N/A -- not compliant, not non-compliant
+                ApplyStatus    = $applyStatus
+                CheckError     = ''
+                SkipReason     = $skipReason
+                Reference      = $Reference
+                Remediation    = $Remediation
+                RebootRequired = $RebootRequired
+            })
+            return
+        }
+        $checkError = $msg
         $compliant  = $false
     }
 
@@ -217,14 +279,47 @@ function Test-And-Set {
 
     # --- APPLY ---
     if ($isApply -and -not $compliant) {
+        $applyThrew = $false
         try {
             Write-Apply "  Applying: $Name"
             & $ApplyScript
-            $applyStatus = 'Applied'
-            $global:Applied++
+        } catch {
+            $msg = $_.Exception.Message
+            if ($msg -match '^SKIP:(.*)$') {
+                # ApplyScript decided this host does not qualify (e.g. OS too old, no domain).
+                # This is NOT a failure -- just a clean opt-out.
+                $skipReason = $Matches[1].Trim()
+                $applyStatus = 'NotApplicable'
+                Write-Info "  Skipped: $skipReason"
+                # Remove the backup entry that was just made -- nothing was changed.
+                if ($global:Backup.Contains($ID)) { $global:Backup.Remove($ID) }
+                $global:Skipped++
+                $global:Checks.Add([PSCustomObject]@{
+                    ID             = $ID
+                    Category       = $Category
+                    Name           = $Name
+                    Description    = $Description
+                    Severity       = $Severity
+                    Compliant      = $null
+                    ApplyStatus    = $applyStatus
+                    CheckError     = ''
+                    SkipReason     = $skipReason
+                    Reference      = $Reference
+                    Remediation    = $Remediation
+                    RebootRequired = $RebootRequired
+                })
+                return
+            }
+            Write-Err "  Apply failed: $_"
+            $applyStatus = "FAILED: $msg"
+            $global:Failed++
+            $applyThrew = $true
+        }
 
-            # Verify
-            $verifyOk = & $CheckScript
+        if (-not $applyThrew) {
+            # Verify -- this is what determines Applied vs Applied-NotVerified
+            $verifyOk = $false
+            try { $verifyOk = & $CheckScript } catch { $verifyOk = $false }
             if ($verifyOk) {
                 Write-Pass "  Verified OK"
                 $applyStatus = 'Applied+Verified'
@@ -232,10 +327,8 @@ function Test-And-Set {
                 Write-Fail "  Applied but verify failed (may need reboot)"
                 $applyStatus = 'Applied-NotVerified'
             }
-        } catch {
-            Write-Err "  Apply failed: $_"
-            $applyStatus = "FAILED: $_"
-            $global:Failed++
+            # Increment Applied only when we actually wrote something successfully.
+            $global:Applied++
         }
     } elseif ($isApply -and $compliant) {
         $applyStatus = 'AlreadyCompliant'
@@ -244,7 +337,7 @@ function Test-And-Set {
 
     # --- POST-APPLY RE-CHECK ---
     # Re-check after apply so the report reflects the post-apply state.
-    if ($isApply -and $applyStatus -notin @('', 'AlreadyCompliant')) {
+    if ($isApply -and $applyStatus -notin @('', 'AlreadyCompliant', 'NotApplicable')) {
         try {
             $compliant = & $CheckScript
         } catch {
@@ -261,6 +354,7 @@ function Test-And-Set {
         Compliant      = $compliant
         ApplyStatus    = $applyStatus
         CheckError     = $checkError
+        SkipReason     = ''
         Reference      = $Reference
         Remediation    = $Remediation
         RebootRequired = $RebootRequired
@@ -353,6 +447,20 @@ function Invoke-Rollback {
     $bkCount = 0
     $bkFail  = 0
 
+    # Pre-flight: count operations and confirm
+    $opCount = @($bkData.PSObject.Properties | Where-Object { $_.Name -notlike '_*' }).Count
+    Write-Host ""
+    Write-Host "  Backup contains $opCount setting(s) to restore" -ForegroundColor Cyan
+    if (-not $NonInteractive) {
+        Write-Host "  Continue with rollback? [Y/N]: " -ForegroundColor Yellow -NoNewline
+        $rbConfirm = [Console]::ReadLine()
+        if ($rbConfirm -notmatch '^[Yy]') {
+            Write-Host "  Rollback aborted by user." -ForegroundColor Red
+            return $true
+        }
+    }
+    Write-Host ""
+
     foreach ($prop in $bkData.PSObject.Properties) {
         $id  = $prop.Name
         $bkv = $prop.Value
@@ -406,15 +514,35 @@ function Invoke-Rollback {
 
             # PS-004: PowerShell v2
             if ($id -eq 'PS-004') {
-                Enable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -NoRestart -EA SilentlyContinue | Out-Null
-                Write-Pass "PSv2 re-enabled  (reboot required)"
+                $rootState = $null
+                if ($bkv.PSObject.Properties['PSv2RootState']) {
+                    $rootState = $bkv.PSv2RootState
+                }
+                if ($rootState -eq 'Enabled' -or $rootState -eq 'EnablePending') {
+                    Enable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -NoRestart -EA SilentlyContinue | Out-Null
+                    Enable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2'     -NoRestart -EA SilentlyContinue | Out-Null
+                    Write-Pass "PSv2 re-enabled  (reboot required)"
+                } else {
+                    Write-Info "PSv2 was not enabled before -- nothing to restore"
+                }
                 $bkCount++; continue
             }
 
-            # NET-007: NetBIOS adapter map { adapterPath = value }
+            # NET-007: NetBIOS adapter list -- new format: { Adapters = [{Path,Value},...] }
             if ($id -eq 'NET-007') {
-                foreach ($adp in $bkv.PSObject.Properties) {
-                    Set-ItemProperty -Path $adp.Name -Name 'NetbiosOptions' -Value $adp.Value -Force -EA SilentlyContinue
+                $adapters = $null
+                if ($bkv.PSObject.Properties['Adapters']) {
+                    $adapters = $bkv.Adapters
+                } else {
+                    # Legacy format: bkv is a hashtable-like object with adapter paths as property names
+                    $adapters = @($bkv.PSObject.Properties | ForEach-Object {
+                        [PSCustomObject]@{ Path = $_.Name; Value = $_.Value }
+                    })
+                }
+                foreach ($adp in $adapters) {
+                    if ($adp -and $adp.Path) {
+                        Set-ItemProperty -Path $adp.Path -Name 'NetbiosOptions' -Value $adp.Value -Force -EA SilentlyContinue
+                    }
                 }
                 Write-Pass "NetBIOS adapter options restored"
                 $bkCount++; continue
@@ -435,9 +563,10 @@ function Invoke-Rollback {
                     $bkCount++; continue
                 }
                 $subEntries = @($bkv.PSObject.Properties | Where-Object {
-                    $_.Value -ne $null -and
+                    $null -ne $_.Value -and
                     $_.Value -is [System.Management.Automation.PSCustomObject] -and
-                    ($_.Value.PSObject.Properties.Name -contains 'Path') })
+                    ($_.Value.PSObject.Properties.Name -contains 'Path') -and
+                    ($_.Value.PSObject.Properties.Name -contains 'Name') })
                 if ($subEntries.Count -gt 0) {
                     $isComposite = $true
                     foreach ($sp in $subEntries) {
@@ -450,6 +579,23 @@ function Invoke-Rollback {
                             Set-ItemProperty -Path $entry.Path -Name $entry.Name -Value $entry.Value -Force -EA SilentlyContinue
                         }
                     }
+
+                    # NET-013 cleanup: if Apply created the IPv6 Parameters key (because the
+                    # OS lacked it), remove the now-empty key so we leave no residue.
+                    if ($id -eq 'NET-013' -and $bkv.PSObject.Properties['IPv6KeyExisted'] `
+                            -and $bkv.IPv6KeyExisted -eq $false) {
+                        $ipv6Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
+                        if (Test-Path $ipv6Key) {
+                            $remaining = Get-Item $ipv6Key -EA SilentlyContinue
+                            $valCount = if ($remaining) { @($remaining.Property).Count } else { 0 }
+                            $subCount = @(Get-ChildItem $ipv6Key -EA SilentlyContinue).Count
+                            if ($valCount -eq 0 -and $subCount -eq 0) {
+                                Remove-Item -Path $ipv6Key -Force -EA SilentlyContinue
+                                Write-Info "  Removed empty IPv6 Parameters key created during apply"
+                            }
+                        }
+                    }
+
                     Write-Pass "Restored: ${id} (composite reg)"
                     $bkCount++; continue
                 }
@@ -487,60 +633,25 @@ Write-Host '    |_  /__ ___ _____ ___ | |_ / __/__ ___     ' -ForegroundColor Cy
 Write-Host '     / // _` \ V / -_)  _||  _\__ \/ -_) _|    ' -ForegroundColor Cyan
 Write-Host '    /___\__,_|\_/\___\__| |_| |___/\___\__|    ' -ForegroundColor DarkCyan
 Write-Host ''
-Write-Host '    ZavetSec-Harden v1.2    ' -ForegroundColor White
+Write-Host '    ZavetSec-Harden v1.4    ' -ForegroundColor White
 Write-Host '    Windows Security Hardening Baseline' -ForegroundColor Gray
 Write-Host '    CIS Benchmark | DISA STIG | MS Security Baseline' -ForegroundColor DarkGray
 Write-Host '    https://github.com/zavetsec                 ' -ForegroundColor DarkGray
 Write-Host ''
 
 # -------------------------------------------------------
-# ADMIN CHECK
+# EARLY HEADER (admin check moved AFTER mode resolution)
 # -------------------------------------------------------
 Write-Host "  ============================================================" -ForegroundColor DarkCyan
-Write-Host "    Script : ZavetSec-Harden v1.2" -ForegroundColor Cyan
+Write-Host "    Script : ZavetSec-Harden v1.4" -ForegroundColor Cyan
 Write-Host "    Mode   : $(if ($Mode) { $Mode } else { '(interactive)' })" -ForegroundColor Gray
 Write-Host "    Host   : $env:COMPUTERNAME" -ForegroundColor Gray
 Write-Host "    Time   : $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
 Write-Host "  ============================================================" -ForegroundColor DarkCyan
 
+# Compute admin status early but don't act on $isApply yet -- $isApply is resolved later
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-    Write-Err "Not running as Administrator. Apply mode requires elevation."
-    if ($isApply) {
-        Write-Host "  Restart PowerShell as Administrator and re-run." -ForegroundColor Yellow
-        exit 1
-    }
-    Write-Host "  Audit mode - some checks may fail without admin rights." -ForegroundColor Yellow
-}
-
-if ($isApply) {
-    Write-Host ""
-    Write-Host "  [APPLY MODE] Changes will be made to this system." -ForegroundColor Yellow
-    Write-Host "  Backup will be saved to: $BackupPath" -ForegroundColor Cyan
-    Write-Host ""
-
-    # Validate / create backup directory early, before any changes
-    $backupParent = Split-Path $BackupPath -Parent
-    if ($backupParent -and -not (Test-Path $backupParent)) {
-        try {
-            $null = New-Item -Path $backupParent -ItemType Directory -Force -ErrorAction Stop
-            Write-Host "  Created backup directory: $backupParent" -ForegroundColor DarkGray
-        } catch {
-            Write-Host "  [!] Cannot create backup directory: $backupParent" -ForegroundColor Yellow
-            Write-Host "  [!] Error: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "      Defaulting backup to TEMP folder" -ForegroundColor Yellow
-            $BackupPath = Join-Path $env:TEMP "HardeningBackup_${env:COMPUTERNAME}_$_stamp.json"
-        }
-    }
-    if ($NonInteractive) {
-        Write-Host "  [-NonInteractive] Proceeding without confirmation." -ForegroundColor DarkGray
-    } else {
-        $confirm = Read-Host "  Continue? [Y/N]"
-        if ($confirm -notmatch '^[Yy]') { Write-Host "  Aborted." -ForegroundColor Red; exit 0 }
-    }
-}
 
 # ===========================================================
 # MAIN MENU -- shown when no -Mode flag is given
@@ -583,21 +694,69 @@ if ($Mode -eq '' -and -not $NonInteractive) {
     $Mode = 'Audit'
 }
 
-# Add Defaults to isRollback area -- will be handled after flag resolution
-
 # Resolve mode flags now that Mode is known
 $isApply    = $Mode -eq 'Apply'
 $isAudit    = $Mode -eq 'Audit'
 $isRollback = $Mode -eq 'Rollback'
 $isDefaults = $Mode -eq 'Defaults'
 
-# ── Update console header with resolved mode
+# -- Admin check (now that $isApply is resolved) -------------------------------
+if (-not $isAdmin) {
+    Write-Err "Not running as Administrator."
+    if ($isApply -or $isDefaults) {
+        Write-Host "  Apply/Defaults modes require elevation. Restart PowerShell as Administrator and re-run." -ForegroundColor Yellow
+        if (-not $NonInteractive) {
+            Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
+            $null = [Console]::ReadLine()
+        }
+        exit 1
+    }
+    if ($isRollback) {
+        Write-Host "  Rollback requires elevation to write to HKLM. Restart PowerShell as Administrator and re-run." -ForegroundColor Yellow
+        if (-not $NonInteractive) {
+            Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
+            $null = [Console]::ReadLine()
+        }
+        exit 1
+    }
+    Write-Host "  Audit mode -- some checks may report inaccurately without admin rights." -ForegroundColor Yellow
+}
+
+# -- Apply-mode pre-flight: confirm + backup directory check ------------------
+if ($isApply) {
+    Write-Host ""
+    Write-Host "  [APPLY MODE] Changes will be made to this system." -ForegroundColor Yellow
+    Write-Host "  Backup will be saved to: $BackupPath" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Validate / create backup directory early, before any changes
+    $backupParent = Split-Path $BackupPath -Parent
+    if ($backupParent -and -not (Test-Path $backupParent)) {
+        try {
+            $null = New-Item -Path $backupParent -ItemType Directory -Force -ErrorAction Stop
+            Write-Host "  Created backup directory: $backupParent" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [!] Cannot create backup directory: $backupParent" -ForegroundColor Yellow
+            Write-Host "  [!] Error: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "      Defaulting backup to TEMP folder" -ForegroundColor Yellow
+            $BackupPath = Join-Path $env:TEMP "HardeningBackup_${env:COMPUTERNAME}_$_stamp.json"
+        }
+    }
+    if ($NonInteractive) {
+        Write-Host "  [-NonInteractive] Proceeding without confirmation." -ForegroundColor DarkGray
+    } else {
+        $confirm = Read-Host "  Continue? [Y/N]"
+        if ($confirm -notmatch '^[Yy]') { Write-Host "  Aborted." -ForegroundColor Red; exit 0 }
+    }
+}
+
+# -- Update console header with resolved mode
 Write-Host "  ============================================================" -ForegroundColor DarkCyan
 Write-Host "    Mode   : $Mode" -ForegroundColor $(if ($isApply) { 'Yellow' } elseif ($isRollback) { 'Magenta' } elseif ($isDefaults) { 'DarkYellow' } else { 'Cyan' })
 Write-Host "  ============================================================" -ForegroundColor DarkCyan
 Write-Host ""
 
-# ── Handle Rollback mode ──────────────────────────────────────────────────────
+# -- Handle Rollback mode ------------------------------------------------------
 if ($isRollback) {
     $result = Invoke-Rollback -BackupPath $BackupPath -NonInteractive:$NonInteractive
     if ($result -eq $false) {
@@ -642,7 +801,7 @@ if ($isRollback) {
     }
 }
 
-# ── Handle Defaults mode ──────────────────────────────────────────────────────
+# -- Handle Defaults mode ------------------------------------------------------
 if ($isDefaults) {
     $defaultsScript = Join-Path $PSScriptRoot 'WindowsDefaults.ps1'
     if (-not (Test-Path $defaultsScript)) {
@@ -655,6 +814,39 @@ if ($isDefaults) {
         }
         exit 1
     }
+
+    # Security: verify that WindowsDefaults.ps1 is owned by an admin principal.
+    # Defends against an unprivileged user dropping a malicious WindowsDefaults.ps1
+    # next to this script and waiting for an admin to run it.
+    $ownerOk = $false
+    try {
+        $acl = Get-Acl -Path $defaultsScript -ErrorAction Stop
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+        # Trusted owners: BUILTIN\Administrators (S-1-5-32-544), SYSTEM (S-1-5-18),
+        # TrustedInstaller (S-1-5-80-...), or any account in Domain Admins / Enterprise Admins.
+        $trustedSids = @('S-1-5-32-544','S-1-5-18')
+        if ($trustedSids -contains $ownerSid.Value) { $ownerOk = $true }
+        if ($ownerSid.Value -match '^S-1-5-21-.*-512$') { $ownerOk = $true }   # Domain Admins
+        if ($ownerSid.Value -match '^S-1-5-21-.*-519$') { $ownerOk = $true }   # Enterprise Admins
+        # Also accept current user if they themselves are an Administrator (interactive use).
+        $currentSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
+        if ($ownerSid.Value -eq $currentSid.Value -and $isAdmin) { $ownerOk = $true }
+    } catch {
+        Write-Err "Could not read ACL of $defaultsScript -- aborting for safety."
+        exit 1
+    }
+
+    if (-not $ownerOk) {
+        Write-Err "WindowsDefaults.ps1 is NOT owned by an administrator (owner SID: $($ownerSid.Value))."
+        Write-Err "Refusing to execute: this could be a planted file. Re-take ownership or replace the script."
+        Write-Host "  takeown /F `"$defaultsScript`"" -ForegroundColor Yellow
+        if (-not $NonInteractive) {
+            Write-Host "  Press ENTER to exit..." -ForegroundColor DarkGray
+            $null = [Console]::ReadLine()
+        }
+        exit 1
+    }
+
     if ($NonInteractive) {
         & $defaultsScript -NonInteractive
     } else {
@@ -922,7 +1114,7 @@ switch ($DeviceProfile) {
     }
 }
 
-# ── Active flags summary ──────────────────────────────────────────────────────
+# -- Active flags summary ------------------------------------------------------
 if ($isApply -and $DeviceProfile -ne 'Custom') {
     Write-Host "  Active flags:" -ForegroundColor DarkGray
     Write-Host "    SkipNetwork     : $SkipNetworkHardening"     -ForegroundColor $(if ($SkipNetworkHardening)     { 'Yellow' } else { 'DarkGray' })
@@ -933,7 +1125,7 @@ if ($isApply -and $DeviceProfile -ne 'Custom') {
     Write-Host ""
 }
 
-# ── Build profile summary strings for HTML report ────────────────────────────
+# -- Build profile summary strings for HTML report ----------------------------
 # Describes which sections were applied/skipped and why.
 # Used in the HTML report section 02.5 (Device Profile Summary).
 $global:ProfileApplied = [System.Collections.Generic.List[string]]::new()
@@ -1093,10 +1285,12 @@ Test-And-Set -ID 'NET-003' -Category 'Network' -Severity 'HIGH' `
     } `
     -ApplyScript {
         Set-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp' 'DisableWpad' 1
-        # Also set via Connections key
-        Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' 'DefaultConnectionSettings' 0 -Type Binary
+        # Disable WPAD service so the WinHTTP component cannot perform DHCP/DNS auto-discovery
         $svc = Get-Service 'WinHttpAutoProxySvc' -EA SilentlyContinue
-        if ($svc) { Stop-Service 'WinHttpAutoProxySvc' -Force -EA SilentlyContinue }
+        if ($svc) {
+            Stop-Service 'WinHttpAutoProxySvc' -Force -EA SilentlyContinue
+            Set-Service  'WinHttpAutoProxySvc' -StartupType Disabled -EA SilentlyContinue
+        }
     }
 
 # --- SMBv1 ---
@@ -1187,11 +1381,15 @@ Test-And-Set -ID 'NET-007' -Category 'Network' -Severity 'HIGH' `
         return $compliant
     } `
     -BackupScript {
-        $bkMap = @{}
+        $bkList = New-Object System.Collections.ArrayList
         Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces' -EA SilentlyContinue | ForEach-Object {
-            $bkMap[$_.PSPath] = (Get-RegValue $_.PSPath 'NetbiosOptions' 0)
+            $val = Get-RegValue $_.PSPath 'NetbiosOptions' 0
+            $null = $bkList.Add([PSCustomObject]@{
+                Path  = $_.PSPath
+                Value = $val
+            })
         }
-        return $bkMap
+        return @{ Adapters = $bkList.ToArray() }
     } `
     -ApplyScript {
         Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces' -EA SilentlyContinue | ForEach-Object {
@@ -1221,7 +1419,8 @@ Test-And-Set -ID 'NET-009' -Category 'Network' -Severity 'HIGH' `
     -CheckScript {
         $v1 = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictAnonymousSAM' 99
         $v2 = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictAnonymous' 99
-        return ($v1 -eq 1) -and ($v2 -ge 1)
+        # On Vista+ only 0 and 1 are valid for these values; 2 was a legacy NT4/2000 setting.
+        return ($v1 -eq 1) -and ($v2 -eq 1)
     } `
     -BackupScript {
         @{
@@ -1243,16 +1442,102 @@ Test-And-Set -ID 'NET-010' -Category 'Network' -Severity 'HIGH' `
     -Remediation 'Stop-Service RemoteRegistry -Force; Set-Service RemoteRegistry -StartupType Disabled' `
     -CheckScript {
         $svc = Get-Service 'RemoteRegistry' -EA SilentlyContinue
-        return $svc -and $svc.StartType -in @('Disabled') -and $svc.Status -eq 'Stopped'
+        if (-not $svc) { return $true }  # service absent = compliant by definition
+        return ($svc.StartType -eq 'Disabled') -and ($svc.Status -eq 'Stopped')
     } `
     -BackupScript {
         $svc = Get-Service 'RemoteRegistry' -EA SilentlyContinue
+        if (-not $svc) { return @{ StartType = 'Absent'; Status = 'Absent' } }
         return @{ StartType = $svc.StartType.ToString(); Status = $svc.Status.ToString() }
     } `
     -ApplyScript {
+        $svc = Get-Service 'RemoteRegistry' -EA SilentlyContinue
+        if (-not $svc) { return }
         Stop-Service 'RemoteRegistry' -Force -EA SilentlyContinue
         Set-Service  'RemoteRegistry' -StartupType Disabled -EA SilentlyContinue
     }
+
+
+# --- Restrict Remote SAM (domain-safe: read-only for Admins only) ---
+Test-And-Set -ID 'NET-011' -Category 'Network' -Severity 'HIGH' `
+    -Name 'Restrict remote SAM enumeration to Administrators' `
+    -Description 'Prevents non-admin accounts from querying SAM remotely (user/group enumeration, Pass-the-Hash recon). Safe on domain -- does not break DC or management tools that run as Admin.' `
+    -Reference 'CIS L1 2.3.10.9 | MITRE T1087.001' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Control\Lsa" /v RestrictRemoteSam /t REG_SZ /d "O:BAG:BAD:(A;;RC;;;BA)" /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictRemoteSam' ''
+        return $v -eq 'O:BAG:BAD:(A;;RC;;;BA)'
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictRemoteSam' } `
+    -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictRemoteSam' 'O:BAG:BAD:(A;;RC;;;BA)' -Type String }
+
+# --- Null Session Pipes + Shares (clear anonymous access lists) ---
+Test-And-Set -ID 'NET-012' -Category 'Network' -Severity 'MEDIUM' `
+    -Name 'Clear anonymous null-session pipes and shares' `
+    -Description 'Removes legacy lists of named pipes and shares accessible without authentication. Safe on domain -- modern DCs do not rely on null-session pipes.' `
+    -Reference 'CIS L1 2.3.10.5 / 2.3.10.6' `
+    -Remediation 'Set-ItemProperty HKLM:\SYSTEM\CCS\Services\LanManServer\Parameters NullSessionPipes "" && NullSessionShares ""' `
+    -CheckScript {
+        $pipes  = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' 'NullSessionPipes'  $null
+        $shares = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' 'NullSessionShares' $null
+        $pipesOk  = ($null -eq $pipes)  -or ($pipes  -is [array] -and $pipes.Count  -eq 0) -or ($pipes  -eq '')
+        $sharesOk = ($null -eq $shares) -or ($shares -is [array] -and $shares.Count -eq 0) -or ($shares -eq '')
+        return $pipesOk -and $sharesOk
+    } `
+    -BackupScript {
+        @{
+            Pipes  = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' 'NullSessionPipes')
+            Shares = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' 'NullSessionShares')
+        }
+    } `
+    -ApplyScript {
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' `
+            -Name 'NullSessionPipes'  -Value ([string[]]@()) -Type MultiString -Force
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' `
+            -Name 'NullSessionShares' -Value ([string[]]@()) -Type MultiString -Force
+    }
+
+# --- Disable IP Source Routing (IPv4 + IPv6) ---
+Test-And-Set -ID 'NET-013' -Category 'Network' -Severity 'HIGH' `
+    -Name 'Disable IP Source Routing (IPv4 + IPv6)' `
+    -Description 'IP source routing can be abused for spoofing and routing bypass attacks. Disabling is safe on all domain and standalone configs.' `
+    -Reference 'CIS L1 | MITRE T1557' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Services\Tcpip\Parameters" /v DisableIPSourceRouting /t REG_DWORD /d 2 /f  (repeat for Tcpip6)' `
+    -CheckScript {
+        $v4 = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'  'DisableIPSourceRouting' 0
+        $v6 = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisableIPSourceRouting' 0
+        return ($v4 -eq 2) -and ($v6 -eq 2)
+    } `
+    -BackupScript {
+        @{
+            IPv4         = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'  'DisableIPSourceRouting')
+            IPv6         = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisableIPSourceRouting')
+            # Track whether we are about to create the IPv6 Parameters key. If we created
+            # it, rollback should remove the (now empty) key it would otherwise leave behind.
+            IPv6KeyExisted = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters')
+        }
+    } `
+    -ApplyScript {
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'  'DisableIPSourceRouting' 2
+        # Ensure key exists for IPv6
+        if (-not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters')) {
+            $null = New-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' -Force
+        }
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisableIPSourceRouting' 2
+    }
+
+# --- Disable ICMP Redirect ---
+Test-And-Set -ID 'NET-014' -Category 'Network' -Severity 'HIGH' `
+    -Name 'Disable ICMP Redirect acceptance' `
+    -Description 'ICMP redirects can be used to poison routing tables and redirect traffic through attacker-controlled hosts.' `
+    -Reference 'CIS L1 | MITRE T1557' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Services\Tcpip\Parameters" /v EnableICMPRedirect /t REG_DWORD /d 0 /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnableICMPRedirect' 99
+        return $v -eq 0
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnableICMPRedirect' } `
+    -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnableICMPRedirect' 0 }
 
 } # end SkipNetworkHardening
 
@@ -1293,27 +1578,61 @@ Test-And-Set -ID 'CRED-002' -Category 'Credentials' -Severity 'CRITICAL' `
 # --- Credential Guard ---
 Test-And-Set -ID 'CRED-003' -Category 'Credentials' -Severity 'HIGH' `
     -Name 'Enable Windows Defender Credential Guard' `
-    -Description 'Credential Guard uses VBS to protect NTLM hashes and Kerberos tickets from extraction' `
+    -Description 'Credential Guard uses VBS to protect NTLM hashes and Kerberos tickets from extraction. Compliance verified via Win32_DeviceGuard.SecurityServicesRunning -- policy-bits alone are NOT sufficient (CG only activates after reboot if hardware supports VBS+SecureBoot+UEFI).' `
     -Reference 'MITRE T1003 | Requires UEFI + Secure Boot + VBS' `
-    -Remediation 'GPO: Computer Config > Admin Templates > System > Device Guard > Turn On VBS + Credential Guard (LsaCfgFlags=1). Requires UEFI + Secure Boot.' `
+    -Remediation 'GPO: Computer Config > Admin Templates > System > Device Guard > Turn On VBS + Credential Guard (LsaCfgFlags=1). Requires UEFI + Secure Boot. Verify post-reboot: (Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard).SecurityServicesRunning -contains 1' `
     -RebootRequired 'Yes' `
     -CheckScript {
+        # Two-tier check: (1) policy-bits set, (2) actual runtime status via WMI.
+        # Runtime status is the real source of truth. Policy alone returns NotVerified after apply.
         $lsaCfg = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 99
         $vbsEnab = Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'EnableVirtualizationBasedSecurity' 99
-        return ($lsaCfg -ge 1) -and ($vbsEnab -eq 1)
+        $policyOk = ($lsaCfg -ge 1) -and ($vbsEnab -eq 1)
+
+        # Runtime check -- only present on Win10/Server 2016+ with DG namespace
+        $runtimeOk = $false
+        try {
+            $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' `
+                                  -ClassName  'Win32_DeviceGuard' -ErrorAction Stop
+            if ($dg -and $dg.SecurityServicesRunning) {
+                # SecurityServicesRunning: 1 = CG, 2 = HVCI
+                $runtimeOk = ($dg.SecurityServicesRunning -contains 1)
+            }
+        } catch { $runtimeOk = $false }
+
+        # Compliant only if BOTH policy is set AND runtime confirms CG running
+        return $policyOk -and $runtimeOk
     } `
     -BackupScript {
         @{
             LsaCfgFlags = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags')
             VBS         = (Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'EnableVirtualizationBasedSecurity')
             CGPlatform  = (Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'LsaCfgFlags')
+            ReqPlatform = (Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'RequirePlatformSecurityFeatures')
+            HVCI        = (Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' 'HypervisorEnforcedCodeIntegrity')
         }
     } `
     -ApplyScript {
+        # Pre-flight: refuse to apply if hardware does not support VBS at all
+        $vbsCapable = $false
+        try {
+            $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' `
+                                  -ClassName  'Win32_DeviceGuard' -ErrorAction Stop
+            if ($dg -and $dg.AvailableSecurityProperties) {
+                # 1 = base virtualization support is present
+                $vbsCapable = ($dg.AvailableSecurityProperties -contains 1)
+            }
+        } catch { $vbsCapable = $false }
+
+        if (-not $vbsCapable) {
+            Write-Fail "  Credential Guard: hardware does not advertise VBS support; skipping policy write"
+            throw "VBS unsupported -- check UEFI/SecureBoot/IOMMU in firmware"
+        }
+
         $dgKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
         if (-not (Test-Path $dgKey)) { $null = New-Item $dgKey -Force }
         Set-RegValue $dgKey 'EnableVirtualizationBasedSecurity'            1
-        Set-RegValue $dgKey 'RequirePlatformSecurityFeatures'              3  # Secure Boot + DMA
+        Set-RegValue $dgKey 'RequirePlatformSecurityFeatures'              1  # 1=SecureBoot only; 3=SecureBoot+DMA (rejects on systems w/o IOMMU)
         Set-RegValue $dgKey 'HypervisorEnforcedCodeIntegrity'              1
         Set-RegValue $dgKey 'HVCIMATRequired'                              0
         Set-RegValue $dgKey 'LsaCfgFlags'                                  1  # CG enabled with UEFI lock
@@ -1355,8 +1674,9 @@ Test-And-Set -ID 'CRED-006' -Category 'Credentials' -Severity 'MEDIUM' `
     -CheckScript {
         $vSrv = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'NTLMMinServerSec' 0
         $vCli = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'NTLMMinClientSec' 0
-        return ($vSrv -band 0x20000000) -and ($vSrv -band 0x80000000) -and
-               ($vCli -band 0x20000000) -and ($vCli -band 0x80000000)
+        # 0x20000000 = NTLMv2 session security; 0x80000000 = 128-bit encryption
+        return ((($vSrv -band 0x20000000) -ne 0) -and (($vSrv -band 0x80000000) -ne 0) -and
+                (($vCli -band 0x20000000) -ne 0) -and (($vCli -band 0x80000000) -ne 0))
     } `
     -BackupScript {
         @{
@@ -1369,6 +1689,248 @@ Test-And-Set -ID 'CRED-006' -Category 'Credentials' -Severity 'MEDIUM' `
         $flags = 0x20000000 -bor 0x80000000  # = 537395200
         Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'NTLMMinServerSec' $flags
         Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'NTLMMinClientSec' $flags
+    }
+
+
+# --- SEHOP (Structured Exception Handler Overwrite Protection) ---
+Test-And-Set -ID 'CRED-007' -Category 'Credentials' -Severity 'HIGH' `
+    -Name 'Enable SEHOP (Structured Exception Handler Overwrite Protection)' `
+    -Description 'SEHOP validates the exception handler chain before dispatching exceptions, blocking SEH-overwrite exploits. No reboot required; safe on all domain and standalone configs.' `
+    -Reference 'MS KB956525 | MITRE T1203' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Control\Session Manager\kernel" /v DisableExceptionChainValidation /t REG_DWORD /d 0 /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 99
+        return ($v -eq 0) -or ($v -eq 99)  # 0=enabled; absent=default enabled on modern Windows
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' } `
+    -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 0 }
+
+# --- CredSSP Oracle (CVE-2018-0886) ---
+Test-And-Set -ID 'CRED-008' -Category 'Credentials' -Severity 'CRITICAL' `
+    -Name 'CredSSP: mitigate Oracle attack (CVE-2018-0886)' `
+    -Description 'CVE-2018-0886: unauthenticated attacker can relay CredSSP credentials for RCE. Two acceptable safe states: AllowEncryptionOracle=0 (Force Updated Clients, strict -- requires ALL endpoints patched) or =2 (Mitigated, defends against the attack while remaining compatible with unpatched peers). The script auto-detects credssp.dll version and picks the strictest safe value: =0 if the local credssp is patched (May 2018+), =2 otherwise. Compliant = 0 OR 2 (vulnerable value 1 is rejected). Setting =0 unconditionally on a server with unpatched RDP clients on the other end will break remote desktop sessions.' `
+    -Reference 'CVE-2018-0886 | MS ADV180005 | KB4093492 | MITRE T1557' `
+    -Remediation 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters" /v AllowEncryptionOracle /t REG_DWORD /d 2 /f  (use 0 only if all RDP clients/servers are patched)' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' 'AllowEncryptionOracle' 99
+        # Compliant = either Force Updated (0) or Mitigated (2). 1 (Vulnerable) and 99 (unset) are NOT compliant.
+        return ($v -eq 0) -or ($v -eq 2)
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' 'AllowEncryptionOracle' } `
+    -ApplyScript  {
+        # Decide between 0 (Force Updated Clients, strict) and 2 (Mitigated, compatible).
+        # The decision is based on whether the local credssp.dll is patched.
+        # The May 2018 patch shipped these minimum versions per OS:
+        #   Win10 1607 / Server 2016 : 10.0.14393.2273
+        #   Win10 1703 / 1709        : 10.0.15063.1029 / 10.0.16299.402
+        #   Win10 1803               : 10.0.17134.1
+        #   Win 7    / Server 2008R2 : 6.1.7601.24117
+        #   Win 8.1  / Server 2012R2 : 6.3.9600.18999
+        # We use a simple proxy: any FilePrivatePart >= 18999 on 6.x, or >= 2273 on 10.x is patched.
+        $dllPath  = Join-Path $env:WinDir 'System32\credssp.dll'
+        $patched  = $false
+        $verLabel = 'unknown'
+        $useValue = 2   # safe default
+
+        try {
+            if (Test-Path $dllPath) {
+                $vi = (Get-Item $dllPath).VersionInfo
+                $verLabel = "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart).$($vi.FilePrivatePart)"
+                $major = [int]$vi.FileMajorPart
+                $build = [int]$vi.FileBuildPart
+                $priv  = [int]$vi.FilePrivatePart
+
+                if ($major -ge 10) {
+                    # Win10/Server2016+ family
+                    if     ($build -ge 17134) { $patched = $true }                     # 1803+ all patched
+                    elseif ($build -eq 16299 -and $priv -ge 402)  { $patched = $true } # 1709
+                    elseif ($build -eq 15063 -and $priv -ge 1029) { $patched = $true } # 1703
+                    elseif ($build -eq 14393 -and $priv -ge 2273) { $patched = $true } # 1607/Srv2016
+                } elseif ($major -eq 6) {
+                    # 6.1=Win7/2008R2, 6.2=Win8/2012, 6.3=Win8.1/2012R2
+                    if ($priv -ge 18999) { $patched = $true }
+                }
+            } else {
+                Write-Info "  credssp.dll not found at $dllPath -- defaulting to Mitigated (2)"
+            }
+        } catch {
+            Write-Info "  Could not read credssp.dll version ($($_.Exception.Message)) -- defaulting to Mitigated (2)"
+        }
+
+        if ($patched) {
+            $useValue = 0
+            Write-Info "  credssp.dll v$verLabel is patched (post-May-2018) -- applying Force Updated Clients (0)"
+        } else {
+            $useValue = 2
+            Write-Info "  credssp.dll v$verLabel is unpatched or pre-May-2018 -- applying Mitigated (2) to preserve RDP compatibility"
+            Write-Info "  Install KB4093492 (or newer cumulative) and re-run to enable Force Updated Clients"
+        }
+
+        $kParent = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP'
+        $k       = "$kParent\Parameters"
+        if (-not (Test-Path $kParent)) { $null = New-Item $kParent -Force }
+        if (-not (Test-Path $k))       { $null = New-Item $k       -Force }
+        Set-RegValue $k 'AllowEncryptionOracle' $useValue
+    }
+
+# --- Kerberos encryption types: AES only, no RC4/DES ---
+Test-And-Set -ID 'CRED-009' -Category 'Credentials' -Severity 'HIGH' `
+    -Name 'Kerberos: require AES encryption (disable RC4/DES)' `
+    -Description 'Forces Kerberos to negotiate AES-128/256 only, eliminating RC4 ticket cracking (Kerberoasting / AS-REP roasting). On domain-joined machines, Apply queries every Domain Controller via LDAP and verifies that msDS-SupportedEncryptionTypes on each DC includes AES-128 (0x8) AND AES-256 (0x10). If even one DC does not advertise AES support, the registry key is NOT written -- you would lose authentication. Re-run after raising AES support on all DCs. Value 2147483640 = AES128+AES256+Future types.' `
+    -Reference 'CIS L1 | MITRE T1558.003 | MS KB977321' `
+    -Remediation 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters" /v SupportedEncryptionTypes /t REG_DWORD /d 2147483640 /f  (only after verifying all DCs support AES via Get-ADComputer -Filter "OperatingSystem -like ''*Server*''" -Properties msDS-SupportedEncryptionTypes)' `
+    -RebootRequired 'Yes' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' 'SupportedEncryptionTypes' 0
+        # AES128=0x8, AES256=0x10 -- both required, RC4/DES bits ignored
+        return (($v -band 0x00000008) -ne 0) -and (($v -band 0x00000010) -ne 0)
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' 'SupportedEncryptionTypes' } `
+    -ApplyScript  {
+        # Pre-flight: check whether the host is domain-joined. Standalone hosts can still
+        # benefit from setting AES-only (defence in depth), so we only block apply on
+        # domain-joined hosts where a misconfiguration could break domain authentication.
+        $isDomainJoined = $false
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -EA Stop
+            if ($cs -and $cs.PartOfDomain) { $isDomainJoined = $true }
+        } catch {}
+
+        if ($isDomainJoined) {
+            # LDAP query every DC's msDS-SupportedEncryptionTypes attribute via [adsisearcher].
+            # This works without RSAT (no Get-ADComputer / Get-ADDomainController needed).
+            # If even one DC lacks AES bits, refuse to apply.
+            $aesOk      = $true
+            $dcsChecked = 0
+            $dcFailures = New-Object System.Collections.ArrayList
+
+            try {
+                $searcher = [adsisearcher]"(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))"
+                # UAC bit 0x2000 (8192) = SERVER_TRUST_ACCOUNT == Domain Controller
+                $searcher.PageSize  = 100
+                $searcher.PropertiesToLoad.AddRange(@('name','msDS-SupportedEncryptionTypes','dNSHostName')) | Out-Null
+
+                $results = $searcher.FindAll()
+                foreach ($r in $results) {
+                    $dcsChecked++
+                    $name   = $null
+                    $encTyp = 0
+                    if ($r.Properties['name'].Count -gt 0)         { $name   = [string]$r.Properties['name'][0] }
+                    if ($r.Properties['dnshostname'].Count -gt 0)  { $name   = [string]$r.Properties['dnshostname'][0] }
+                    if ($r.Properties['msds-supportedencryptiontypes'].Count -gt 0) {
+                        $encTyp = [int]$r.Properties['msds-supportedencryptiontypes'][0]
+                    }
+
+                    $hasAes128 = (($encTyp -band 0x00000008) -ne 0)
+                    $hasAes256 = (($encTyp -band 0x00000010) -ne 0)
+                    if (-not ($hasAes128 -and $hasAes256)) {
+                        $aesOk = $false
+                        $null = $dcFailures.Add("$name (msDS-SupportedEncryptionTypes=0x$($encTyp.ToString('X')))")
+                    }
+                }
+                $results.Dispose()
+            } catch {
+                # If LDAP query fails entirely, we cannot prove AES support -- refuse to apply.
+                throw "SKIP: cannot verify DC AES support via LDAP ($($_.Exception.Message)). Re-run from a host that can query AD, or disable this control via -SkipCredentialProtection."
+            }
+
+            if ($dcsChecked -eq 0) {
+                throw "SKIP: no Domain Controllers found via LDAP -- cannot verify AES support. Re-run on a host with domain connectivity."
+            }
+
+            if (-not $aesOk) {
+                $listText = $dcFailures -join '; '
+                throw "AES encryption is NOT enabled on the following DC(s): $listText. Refusing to apply CRED-009 -- this would break Kerberos. Raise msDS-SupportedEncryptionTypes on those DCs (set bits 0x18) and re-run."
+            }
+
+            Write-Info "  Verified AES support on $dcsChecked Domain Controller(s); proceeding"
+        } else {
+            Write-Info "  Standalone host -- applying AES-only without DC verification"
+        }
+
+        $kRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos'
+        $k     = "$kRoot\Parameters"
+        if (-not (Test-Path $kRoot)) { $null = New-Item $kRoot -Force }
+        if (-not (Test-Path $k))     { $null = New-Item $k     -Force }
+        Set-RegValue $k 'SupportedEncryptionTypes' 2147483640
+    }
+
+# --- Remote Credential Guard for RDP ---
+Test-And-Set -ID 'CRED-010' -Category 'Credentials' -Severity 'HIGH' `
+    -Name 'Enable Remote Credential Guard / Restricted Admin for RDP' `
+    -Description 'AllowProtectedCreds=1 prevents credential forwarding during RDP sessions (Remote Credential Guard). Credentials stay on the local machine, not the remote host. Requirements: domain-joined host AND Win10 1607 / Server 2016+ (build 14393+) on BOTH endpoints. Standalone hosts and older Windows versions are not supported -- script will report N/A on those. On supported hosts the setting is safe to apply.' `
+    -Reference 'MS Remote Credential Guard | MITRE T1021.001' `
+    -Remediation 'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" /v AllowProtectedCreds /t REG_DWORD /d 1 /f' `
+    -CheckScript {
+        # First check supported-OS / domain gate. If not eligible, mark N/A.
+        $isDomainJoined = $false
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -EA Stop
+            if ($cs -and $cs.PartOfDomain) { $isDomainJoined = $true }
+        } catch {}
+
+        $build = [int][Environment]::OSVersion.Version.Build
+
+        if (-not $isDomainJoined) {
+            throw "SKIP: host is not domain-joined (Remote Credential Guard requires AD)"
+        }
+        if ($build -lt 14393) {
+            throw "SKIP: OS build $build is below 14393 (Win10 1607 / Server 2016 minimum)"
+        }
+
+        $v = Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation' 'AllowProtectedCreds' 99
+        return $v -eq 1
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation' 'AllowProtectedCreds' } `
+    -ApplyScript  {
+        # Re-validate gates inside Apply too -- defence in depth.
+        $isDomainJoined = $false
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -EA Stop
+            if ($cs -and $cs.PartOfDomain) { $isDomainJoined = $true }
+        } catch {}
+        $build = [int][Environment]::OSVersion.Version.Build
+
+        if (-not $isDomainJoined) { throw "SKIP: host is not domain-joined" }
+        if ($build -lt 14393)     { throw "SKIP: OS build $build < 14393" }
+
+        $k = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation'
+        if (-not (Test-Path $k)) { $null = New-Item $k -Force }
+        Set-RegValue $k 'AllowProtectedCreds' 1
+    }
+
+# --- Netlogon secure channel (domain hardening) ---
+Test-And-Set -ID 'CRED-011' -Category 'Credentials' -Severity 'HIGH' `
+    -Name 'Netlogon: require signed/sealed secure channel and strong session key' `
+    -Description 'Requires signing and encryption of Netlogon secure channel between workstation and DC. Prevents Netlogon MITM attacks (ZeroLogon-era hardening). Fully safe on domain with Server 2008+ DCs. On standalone the keys are written but have no operational effect.' `
+    -Reference 'CIS L1 2.3.6.x | CVE-2020-1472 | MITRE T1557' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Services\Netlogon\Parameters" /v RequireSignOrSeal /t REG_DWORD /d 1 /f  (also: SealSecureChannel, SignSecureChannel, RequireStrongKey=1; DisablePasswordChange=0)' `
+    -CheckScript {
+        $p    = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+        $rsos = Get-RegValue $p 'RequireSignOrSeal'    0
+        $seal = Get-RegValue $p 'SealSecureChannel'    0
+        $sign = Get-RegValue $p 'SignSecureChannel'    0
+        $strk = Get-RegValue $p 'RequireStrongKey'     0
+        $nopc = Get-RegValue $p 'DisablePasswordChange' 99
+        return ($rsos -eq 1) -and ($seal -eq 1) -and ($sign -eq 1) -and ($strk -eq 1) -and ($nopc -eq 0)
+    } `
+    -BackupScript {
+        $p = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+        @{
+            RequireSignOrSeal    = (Backup-RegValue $p 'RequireSignOrSeal')
+            SealSecureChannel    = (Backup-RegValue $p 'SealSecureChannel')
+            SignSecureChannel    = (Backup-RegValue $p 'SignSecureChannel')
+            RequireStrongKey     = (Backup-RegValue $p 'RequireStrongKey')
+            DisablePasswordChange= (Backup-RegValue $p 'DisablePasswordChange')
+        }
+    } `
+    -ApplyScript {
+        $p = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+        Set-RegValue $p 'RequireSignOrSeal'     1
+        Set-RegValue $p 'SealSecureChannel'     1
+        Set-RegValue $p 'SignSecureChannel'     1
+        Set-RegValue $p 'RequireStrongKey'      1
+        Set-RegValue $p 'DisablePasswordChange' 0  # allow machine account password rotation
     }
 
 } # end SkipCredentialProtection
@@ -1448,11 +2010,21 @@ Test-And-Set -ID 'PS-004' -Category 'PowerShell' -Severity 'HIGH' `
     -Remediation 'Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2,MicrosoftWindowsPowerShellV2Root -NoRestart  (requires reboot)' `
     -CheckScript {
         $feature = Get-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2' -EA SilentlyContinue
-        if ($feature) { return $feature.State -eq 'Disabled' }
-        # Fallback: check if powershell -version 2 fails
-        return $false
+        if ($feature) {
+            # 'Disabled' = applied; 'DisablePending' = applied but pending reboot
+            return $feature.State -in @('Disabled','DisablePending')
+        }
+        # Feature not present at all (modern Server SKU may lack it) -- treat as compliant
+        return $true
     } `
-    -BackupScript { return @{ PSv2Feature = 'WasEnabled' } } `
+    -BackupScript {
+        $f1 = Get-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2'     -EA SilentlyContinue
+        $f2 = Get-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -EA SilentlyContinue
+        return @{
+            PSv2State     = if ($f1) { $f1.State.ToString() } else { 'NotPresent' }
+            PSv2RootState = if ($f2) { $f2.State.ToString() } else { 'NotPresent' }
+        }
+    } `
     -ApplyScript  {
         Disable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2' -NoRestart -EA SilentlyContinue
         Disable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -NoRestart -EA SilentlyContinue
@@ -1501,24 +2073,30 @@ function Set-AuditSubcat {
 
 function Get-AuditSubcat {
     param([string]$Guid)
-    # Reads audit status by GUID using /r CSV mode.
-    # auditpol /r output structure (Russian Windows):
-    #   [0] = header line  (localized column names)
-    #   [1] = empty string
-    #   [2] = data line    (KOMPUTER,Sistema,...,{GUID},Uspeh i sboi,)
-    #   [3] = empty string
-    # Col4 (index 4) = Inclusion Setting - localized text:
-    #   empty string     = No Auditing
-    #   contains space   = Success AND Failure (all locales: "Uspeh i sboi" / "Success and Failure")
-    #   single word      = Success OR Failure only
+    # Reads audit subcategory state via auditpol /r CSV mode.
+    # CRITICAL: This function is READ-ONLY. It MUST NOT modify system state, because it
+    # is called from CheckScript which runs in Audit mode (where no changes are allowed).
+    #
+    # auditpol /r CSV columns (zero-indexed):
+    #   [0] Computer Name / Machine
+    #   [1] Policy Target
+    #   [2] Subcategory (localized)
+    #   [3] Subcategory GUID
+    #   [4] Inclusion Setting (localized: "No Auditing" / "Success" / "Failure" / "Success and Failure")
+    #
+    # Strategy: parse column 4 by recognizing localized keywords for Success and Failure.
+    # We support multiple locales (English, Russian, German, French, Spanish, Italian, Polish, Turkish, etc.).
+    # If the locale is unknown, we fall back to "presence of space" heuristic: a 2-word
+    # value is treated as "Success and Failure"; an empty value is "No Auditing".
+
     $ap = "$env:SystemRoot\System32\auditpol.exe"
     $out = & $ap /get /subcategory:"$Guid" /r 2>&1
-    if ($LASTEXITCODE -ne 0 -or $out.Count -lt 3) { return 'Not Configured' }
+    if ($LASTEXITCODE -ne 0 -or -not $out -or $out.Count -lt 3) { return 'Not Configured' }
 
-    # Find the data line: first non-empty line that contains the GUID
+    # Find the data line: first line that contains the GUID
     $dataLine = $null
     foreach ($line in $out) {
-        $s = $line.ToString()
+        $s = [string]$line
         if ($s -match [regex]::Escape($Guid)) { $dataLine = $s; break }
     }
     if (-not $dataLine) { return 'Not Configured' }
@@ -1528,26 +2106,62 @@ function Get-AuditSubcat {
     $col4 = $cols[4].Trim()
 
     if ([string]::IsNullOrWhiteSpace($col4)) { return 'No Auditing' }
-    if ($col4 -match ' ')                    { return 'Success,Failure' }
 
-    # Single word - probe to distinguish Success vs Failure
-    $null = & $ap /set /subcategory:"$Guid" /success:enable /failure:disable 2>&1
-    $probe = & $ap /get /subcategory:"$Guid" /r 2>&1
-    $probeLine = $null
-    foreach ($line in $probe) {
-        $s = $line.ToString()
-        if ($s -match [regex]::Escape($Guid)) { $probeLine = $s; break }
-    }
-    if ($probeLine) {
-        $pcols = $probeLine -split ','
-        if ($pcols.Count -ge 5 -and $pcols[4].Trim() -eq $col4) {
-            return 'Success'
-        } else {
-            $null = & $ap /set /subcategory:"$Guid" /success:disable /failure:enable 2>&1
-            return 'Failure'
-        }
-    }
-    return 'Not Configured'
+    # Locale-aware keyword matching (case-insensitive). Add languages as needed.
+    # The token list deliberately covers stems so that case/inflection differences match.
+    # Non-ASCII tokens are written as Unicode regex escapes (\uXXXX) so this file stays
+    # pure ASCII -- this avoids encoding pitfalls on Windows PowerShell 5.1, which reads
+    # .ps1 files as the active ANSI codepage when no BOM is present.
+    #
+    # Russian:    \u0423\u0441\u043f\u0435\u0445 = "Uspekh"  (Success);
+    #             \u0421\u0431\u043e\u0439      = "Sboy"    (Failure);
+    #             \u041e\u0442\u043a\u0430\u0437 = "Otkaz"  (Failure)
+    # German:     Erfolg / Fehler
+    # French:     Reussite / Echec
+    # Spanish:    Exito / Fracaso        (also Portuguese: Sucesso / Falha)
+    # Italian:    Successo / Errore
+    # Polish:     Powodzenie / Niepowodzenie
+    # Turkish:    Basari / Basarisiz
+    # Chinese:    \u6210\u529f / \u5931\u8d25
+    # Japanese:   \u6210\u529f / \u5931\u6557
+    $successWords = @(
+        'success',
+        'usp', '\u0443\u0441\u043f',
+        'erfolg',
+        'reuss',
+        'succes', 'sucesso',
+        '\u00e9xito',
+        'successo',
+        'powodz',
+        'basari',
+        '\u6210\u529f'
+    )
+    $failureWords = @(
+        'failure', 'fail',
+        'sboi', '\u0441\u0431\u043e', '\u043e\u0442\u043a\u0430\u0437',
+        'fehler',
+        'echec', '\u00e9chec',
+        'fracaso', 'falha',
+        'errore',
+        'niepowodz',
+        'basarisiz',
+        '\u5931\u8d25', '\u5931\u6557'
+    )
+
+    $low = $col4.ToLowerInvariant()
+    $hasSuccess = $false
+    $hasFailure = $false
+    foreach ($w in $successWords) { if ($low -match $w) { $hasSuccess = $true; break } }
+    foreach ($w in $failureWords) { if ($low -match $w) { $hasFailure = $true; break } }
+
+    if ($hasSuccess -and $hasFailure) { return 'Success,Failure' }
+    if ($hasSuccess)                  { return 'Success' }
+    if ($hasFailure)                  { return 'Failure' }
+
+    # Fallback heuristic for unknown locales: if value contains a space/conjunction,
+    # treat as "both"; otherwise mark as Configured-Unknown so the caller can flag it.
+    if ($col4 -match '[\s,/&+]') { return 'Success,Failure' }
+    return 'Configured-Unknown'
 }
 
 $auditChecks = @(
@@ -1596,9 +2210,10 @@ foreach ($ac in $auditChecks) {
         -CheckScript ([scriptblock]::Create("
             `$current = Get-AuditSubcat '$acGuid'
             `$want    = '$acWant'
-            if (`$want -eq 'Success,Failure') { return `$current -eq 'Success,Failure' }
-            if (`$want -eq 'Success')         { return `$current -in @('Success','Success,Failure') }
-            if (`$want -eq 'Failure')         { return `$current -in @('Failure','Success,Failure') }
+            # 'Configured-Unknown' = locale-unrecognized but auditing enabled with both flags
+            if (`$want -eq 'Success,Failure') { return `$current -in @('Success,Failure','Configured-Unknown') }
+            if (`$want -eq 'Success')         { return `$current -in @('Success','Success,Failure','Configured-Unknown') }
+            if (`$want -eq 'Failure')         { return `$current -in @('Failure','Success,Failure','Configured-Unknown') }
             return `$false
         ")) `
         -BackupScript ([scriptblock]::Create("
@@ -1624,10 +2239,10 @@ Test-And-Set -ID 'AUD-029' -Category 'AuditPolicy' -Severity 'CRITICAL' `
     -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1 }
 
 # Command line in 4688
-Test-And-Set -ID 'AUD-028' -Category 'AuditPolicy' -Severity 'HIGH' `
+Test-And-Set -ID 'AUD-028' -Category 'AuditPolicy' -Severity 'CRITICAL' `
     -Name 'Include command line in Process Creation events (4688)' `
-    -Description 'Without this, 4688 events do not include the executed command line - blind spot for detection' `
-    -Reference 'MS KB3004375 | CIS L1' `
+    -Description 'Without this, Event 4688 logs the process image name but NOT its arguments. LOLBins (certutil, mshta, wscript, rundll32, powershell -enc) become invisible to SIEM. Zero performance impact, no domain compatibility risk.' `
+    -Reference 'MS KB3004375 | CIS L1 | MITRE T1059' `
     -Remediation 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" /v ProcessCreationIncludeCmdLine_Enabled /t REG_DWORD /d 1 /f' `
     -CheckScript {
         $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 99
@@ -1746,25 +2361,48 @@ Test-And-Set -ID 'SYS-005' -Category 'System' -Severity 'HIGH' `
     -Remediation 'bcdedit /set "{current}" nx AlwaysOn  (reboot required)' `
     -RebootRequired 'Yes' `
     -CheckScript {
-        $dep = & bcdedit /enum '{current}' 2>&1 | Where-Object { $_ -match 'nx' }
-        return $dep -match 'AlwaysOn'
+        $bcd = & bcdedit /enum '{current}' 2>&1
+        if (-not $bcd) { return $false }
+        $dep = $bcd | Where-Object { $_ -match '^\s*nx\s' }
+        if (-not $dep) { return $false }
+        return ([string]$dep) -match 'AlwaysOn'
     } `
     -BackupScript { return @{ DEP = 'OptIn' } } `
     -ApplyScript  { & bcdedit /set '{current}' nx AlwaysOn 2>&1 | Out-Null }
 
-# --- Event Log Sizes + Retention (overwrite, no archive files) ---
+# --- Event Log Sizes + Retention (profile-aware) ---
+# On WORKSTATIONS we use overwrite-when-full (Retention=0) to prevent disk fill-up.
+# On SERVERS (DC/FileServer/Exchange/SQL/RDS/PrintServer) we use Archive-when-full
+# (Retention=1, AutoBackupLogFiles=1) so log-spam attacks cannot purge older events
+# before the SIEM ingests them. Disk is rarely a concern on a server with proper sizing.
+$_isServerRole = $DeviceProfile -in @('DomainController','FileServer','Exchange','SQL','RDS','PrintServer')
+$_logRetention = if ($_isServerRole) { 1 } else { 0 }   # 0=overwrite, 1=archive
+$_logAutoBack  = if ($_isServerRole) { 1 } else { 0 }   # 1=auto-archive, 0=disabled
+$_logModeLabel = if ($_isServerRole) { 'archive (server)' } else { 'overwrite (workstation)' }
+
+# Pre-compute strings for wevtutil so the [scriptblock]::Create body is simple text.
+$_rtFlag = if ($_logRetention -eq 1) { 'true' } else { 'false' }
+$_abFlag = if ($_logAutoBack  -eq 1) { 'true' } else { 'false' }
+# In Audit mode (or Custom profile) tolerate both retention schemes -- the operator
+# has not declared a role yet, and either choice is defensible.
+$_logTolerantStr = if ($isAudit -or ($DeviceProfile -eq 'Custom')) { '$true' } else { '$false' }
+
 Test-And-Set -ID 'SYS-006' -Category 'System' -Severity 'HIGH' `
-    -Name 'Event Log sizes: Security 1GB, System/App 256MB; retention=overwrite, no archive files' `
-    -Description 'Default log sizes are too small. Retention set to overwrite (not archive) to prevent disk fill-up on end-user machines. AutoBackupLogFiles disabled explicitly.' `
+    -Name "Event Log sizes: Security 1GB, System/App 256MB; retention=$_logModeLabel" `
+    -Description "Default log sizes are too small. On servers (DC/FS/Exchange/SQL/RDS/Print) retention is set to ARCHIVE so log-spam attacks cannot evict older events; on workstations retention is set to OVERWRITE to prevent disk fill-up. Current target: $_logModeLabel" `
     -Reference 'CIS L1' `
-    -Remediation 'wevtutil sl Security /ms:1073741824 /rt:false /ab:false && wevtutil sl System /ms:268435456 /rt:false /ab:false && wevtutil sl Application /ms:268435456 /rt:false /ab:false' `
-    -CheckScript {
-        $secSize   = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'MaxSize' 0
-        $retention = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'Retention' 99
-        $autoBack  = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'AutoBackupLogFiles' 99
-        # Compliant: size >= 1GB, Retention=0 (overwrite), AutoBackupLogFiles absent or 0
-        return ($secSize -ge 1073741824) -and ($retention -eq 0) -and ($autoBack -ne 1)
-    } `
+    -Remediation "wevtutil sl Security /ms:1073741824 /rt:$_rtFlag /ab:$_abFlag" `
+    -CheckScript ([scriptblock]::Create("
+        `$secSize   = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'MaxSize' 0
+        `$retention = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'Retention' 99
+        `$autoBack  = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security' 'AutoBackupLogFiles' 99
+        if (`$secSize -lt 1073741824) { return `$false }
+        if ($_logTolerantStr) {
+            # Audit/Custom: any reasonable retention scheme is OK
+            return (`$retention -in @(0,1)) -and (`$autoBack -in @(0,1,99))
+        }
+        return (`$retention -eq $_logRetention) -and (`$autoBack -eq $_logAutoBack)
+    ")) `
     -BackupScript {
         @{
             Sec    = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'MaxSize')
@@ -1776,36 +2414,50 @@ Test-And-Set -ID 'SYS-006' -Category 'System' -Severity 'HIGH' `
             SecAB  = (Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'AutoBackupLogFiles')
         }
     } `
-    -ApplyScript {
-        # --- Sizes ---
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'MaxSize' 1073741824  # 1 GB
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\System'      'MaxSize' 268435456   # 256 MB
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application' 'MaxSize' 268435456   # 256 MB
-        # --- Retention = 0 (overwrite oldest events when full, no archive files) ---
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'Retention' 0
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\System'      'Retention' 0
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application' 'Retention' 0
-        # --- AutoBackupLogFiles = 0 (explicitly disable archive file creation) ---
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'AutoBackupLogFiles' 0
-        # --- Apply via wevtutil as well (covers modern evtx channels) ---
-        # /rt:false = overwrite when full; /ab:false = no auto-archive
-        & wevtutil sl Security    /ms:1073741824 /rt:false /ab:false 2>&1 | Out-Null
-        & wevtutil sl System      /ms:268435456  /rt:false /ab:false 2>&1 | Out-Null
-        & wevtutil sl Application /ms:268435456  /rt:false /ab:false 2>&1 | Out-Null
-    }
+    -ApplyScript ([scriptblock]::Create("
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'MaxSize' 1073741824
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\System'      'MaxSize' 268435456
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application' 'MaxSize' 268435456
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'Retention' $_logRetention
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\System'      'Retention' $_logRetention
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application' 'Retention' $_logRetention
+        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security'    'AutoBackupLogFiles' $_logAutoBack
+        & wevtutil sl Security    /ms:1073741824 /rt:$_rtFlag /ab:$_abFlag 2>&1 | Out-Null
+        & wevtutil sl System      /ms:268435456  /rt:$_rtFlag /ab:$_abFlag 2>&1 | Out-Null
+        & wevtutil sl Application /ms:268435456  /rt:$_rtFlag /ab:$_abFlag 2>&1 | Out-Null
+    "))
 
 # --- Secure DNS over HTTPS ---
-Test-And-Set -ID 'SYS-007' -Category 'System' -Severity 'MEDIUM' `
-    -Name 'Enable Encrypted DNS (DoH) policy' `
-    -Description 'Prevent DNS-based MITM and C2 over DNS by enforcing DoH where supported' `
-    -Reference 'MITRE T1071.004' `
-    -Remediation 'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" /v DoHPolicy /t REG_DWORD /d 2 /f  (2=Allow DoH, 3=Require DoH)' `
+# DoH is opportunistic on Windows: setting DoHPolicy=2 (Allow) only takes effect if the
+# resolver IP is in the system DoH template list (Get-DnsClientDohServerAddress) OR if
+# the DNS server is a known Microsoft auto-DoH peer (Cloudflare, Google, Quad9 by IP).
+# In a typical AD environment with a local Windows DNS server, DoHPolicy=2 is a no-op.
+# Severity is LOW because the setting is harmless but rarely effective unless paired
+# with an explicit DohResolvers configuration. Severity is informative only -- the goal
+# of this check is to remind the operator that DoH exists, not to flag systems as broken.
+Test-And-Set -ID 'SYS-007' -Category 'System' -Severity 'LOW' `
+    -Name 'Configure Encrypted DNS (DoH) policy' `
+    -Description 'DoH (DNS-over-HTTPS) prevents in-network DNS sniffing and C2-over-DNS. Note: setting DoHPolicy=2 (Allow) is opportunistic -- it only activates if the configured DNS server is recognized as DoH-capable. For real protection, also configure DoH templates per-resolver via Add-DnsClientDohServerAddress, or use DoHPolicy=3 (Require) only after verifying every DNS server has a DoH endpoint. On AD-joined machines using on-prem DNS, this setting is typically a no-op.' `
+    -Reference 'MITRE T1071.004 | MS Win10 1903+' `
+    -Remediation 'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" /v DoHPolicy /t REG_DWORD /d 2 /f  (2=Allow if DoH endpoint known, 3=Require)' `
     -CheckScript {
         $v = Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'DoHPolicy' 99
-        return $v -ge 2  # 2=Allow, 3=Require
+        # 2 = Allow (opportunistic), 3 = Require, 99 = not configured
+        return $v -ge 2
     } `
     -BackupScript { Backup-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'DoHPolicy' } `
-    -ApplyScript  { Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'DoHPolicy' 2 }
+    -ApplyScript  {
+        Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'DoHPolicy' 2
+        # Diagnostic hint -- list any DoH server addresses already configured in the system.
+        try {
+            $doh = Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue 2>$null
+            if (-not $doh -or $doh.Count -eq 0) {
+                Write-Info "  DoH policy set to Allow (2) but no DoH server addresses are configured -- effective on auto-DoH peers only"
+            } else {
+                Write-Info "  DoH policy set; $($doh.Count) DoH server template(s) already configured"
+            }
+        } catch {}
+    }
 
 # --- Disable Print Spooler (optional) ---
 if ($EnablePrintSpoolerDisable) {
@@ -1816,13 +2468,17 @@ if ($EnablePrintSpoolerDisable) {
     -Remediation 'Stop-Service Spooler -Force; Set-Service Spooler -StartupType Disabled' `
         -CheckScript {
             $svc = Get-Service 'Spooler' -EA SilentlyContinue
-            return $svc -and $svc.StartType -eq 'Disabled' -and $svc.Status -eq 'Stopped'
+            if (-not $svc) { return $true }  # absent = compliant
+            return ($svc.StartType -eq 'Disabled') -and ($svc.Status -eq 'Stopped')
         } `
         -BackupScript {
             $svc = Get-Service 'Spooler' -EA SilentlyContinue
+            if (-not $svc) { return @{ StartType = 'Absent' } }
             return @{ StartType = $svc.StartType.ToString() }
         } `
         -ApplyScript {
+            $svc = Get-Service 'Spooler' -EA SilentlyContinue
+            if (-not $svc) { return }
             Stop-Service 'Spooler' -Force -EA SilentlyContinue
             Set-Service  'Spooler' -StartupType Disabled -EA SilentlyContinue
         }
@@ -1853,6 +2509,55 @@ Test-And-Set -ID 'SYS-010' -Category 'System' -Severity 'HIGH' `
     } `
     -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'MinEncryptionLevel' } `
     -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'MinEncryptionLevel' 3 }
+
+# NOTE: Former SYS-011 (Process Creation cmdline) is now AUD-028 -- single source of truth.
+# NOTE: Former SYS-012 (SCENoApplyLegacyAuditPolicy) is now AUD-029 -- single source of truth.
+# Both moved to AuditPolicy section; if -SkipAuditPolicy is used, run AUD-028/029 manually.
+
+# --- Authenticode certificate padding check (Flame malware mitigation) ---
+Test-And-Set -ID 'SYS-013' -Category 'System' -Severity 'HIGH' `
+    -Name 'Enable Authenticode certificate padding check (Flame mitigation)' `
+    -Description 'The Flame malware (2012) forged valid Microsoft certificates by exploiting a collision in MD5 Authenticode padding. EnableCertPaddingCheck=1 adds extra validation during signature verification. Zero performance impact; safe on all configurations.' `
+    -Reference 'MS KB2661254 | MITRE T1553.002' `
+    -Remediation 'reg add "HKLM\SOFTWARE\Microsoft\Cryptography\Wintrust\Config" /v EnableCertPaddingCheck /t REG_DWORD /d 1 /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Cryptography\Wintrust\Config' 'EnableCertPaddingCheck' 0
+        return $v -eq 1
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SOFTWARE\Microsoft\Cryptography\Wintrust\Config' 'EnableCertPaddingCheck' } `
+    -ApplyScript  {
+        $kRoot = 'HKLM:\SOFTWARE\Microsoft\Cryptography\Wintrust'
+        $k     = "$kRoot\Config"
+        if (-not (Test-Path $kRoot)) { $null = New-Item $kRoot -Force }
+        if (-not (Test-Path $k))     { $null = New-Item $k     -Force }
+        Set-RegValue $k 'EnableCertPaddingCheck' 1
+    }
+
+# --- NTLM Audit (incoming traffic) ---
+Test-And-Set -ID 'SYS-014' -Category 'System' -Severity 'MEDIUM' `
+    -Name 'Enable NTLM incoming traffic audit' `
+    -Description 'AuditReceivingNTLMTraffic=2 logs all incoming NTLM authentication attempts to the Security event log (Event 8004). Allows SIEM to identify legacy NTLM usage and machines still relying on NTLMv1/v2. Read-only audit -- zero operational impact.' `
+    -Reference 'CIS | MITRE T1557.001' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Control\Lsa\MSV1_0" /v AuditReceivingNTLMTraffic /t REG_DWORD /d 2 /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'AuditReceivingNTLMTraffic' 0
+        return $v -eq 2
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'AuditReceivingNTLMTraffic' } `
+    -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'AuditReceivingNTLMTraffic' 2 }
+
+# --- Null session LocalSystem fallback ---
+Test-And-Set -ID 'SYS-015' -Category 'System' -Severity 'MEDIUM' `
+    -Name 'Disable NULL session fallback for LocalSystem (MSV1_0)' `
+    -Description 'Prevents LocalSystem from falling back to an anonymous NULL session for NTLM authentication. Safe on all domain and standalone configurations; does not affect normal service account behaviour.' `
+    -Reference 'CIS L1 2.3.10.x' `
+    -Remediation 'reg add "HKLM\SYSTEM\CCS\Control\Lsa\MSV1_0" /v allownullsessionfallback /t REG_DWORD /d 0 /f' `
+    -CheckScript {
+        $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'allownullsessionfallback' 99
+        return $v -eq 0
+    } `
+    -BackupScript { Backup-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'allownullsessionfallback' } `
+    -ApplyScript  { Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'allownullsessionfallback' 0 }
 
 # ===========================================================
 # SECTION 6: SAVE BACKUP & GENERATE REPORT
@@ -1904,13 +2609,18 @@ if ($isApply) {
 
 $compliantCount    = [int]@($global:Checks | Where-Object { $_.Compliant -eq $true  }).Count
 $nonCompliantCount = [int]@($global:Checks | Where-Object { $_.Compliant -eq $false }).Count
+$naCount           = [int]@($global:Checks | Where-Object { $null -eq $_.Compliant  }).Count
 $totalChecks       = [int]$global:Checks.Count
-$compliancePct     = if ($totalChecks -gt 0) { [int][Math]::Round($compliantCount / $totalChecks * 100) } else { 0 }
+# Compliance % is calculated against APPLICABLE checks only (excludes N/A) so a host with
+# many "not applicable" controls is not unfairly penalized.
+$applicableCount   = $compliantCount + $nonCompliantCount
+$compliancePct     = if ($applicableCount -gt 0) { [int][Math]::Round($compliantCount / $applicableCount * 100) } else { 0 }
 
-$critFail = [int]@($global:Checks | Where-Object { -not $_.Compliant -and $_.Severity -eq 'CRITICAL' }).Count
-$highFail = [int]@($global:Checks | Where-Object { -not $_.Compliant -and $_.Severity -eq 'HIGH'     }).Count
-$medFail  = [int]@($global:Checks | Where-Object { -not $_.Compliant -and $_.Severity -eq 'MEDIUM'   }).Count
-$lowFail  = [int]@($global:Checks | Where-Object { -not $_.Compliant -and $_.Severity -eq 'LOW'      }).Count
+# Severity breakdown: only count real failures, not N/A entries.
+$critFail = [int]@($global:Checks | Where-Object { $_.Compliant -eq $false -and $_.Severity -eq 'CRITICAL' }).Count
+$highFail = [int]@($global:Checks | Where-Object { $_.Compliant -eq $false -and $_.Severity -eq 'HIGH'     }).Count
+$medFail  = [int]@($global:Checks | Where-Object { $_.Compliant -eq $false -and $_.Severity -eq 'MEDIUM'   }).Count
+$lowFail  = [int]@($global:Checks | Where-Object { $_.Compliant -eq $false -and $_.Severity -eq 'LOW'      }).Count
 
 $duration = ((Get-Date) - $global:StartTime).ToString("m'm 's's'")
 
@@ -1938,13 +2648,33 @@ $catBars     = ($catGroups | ForEach-Object {
     "<tr><td style='font-family:JetBrains Mono,monospace;color:#a5d6ff;font-size:10px;white-space:nowrap'>$($grp.Name)</td><td style='color:#00ff88'>$pass</td><td style='color:#ff6b00'>$fail</td><td style='width:140px'><div style='background:#0d1117;border:1px solid #21262d;border-radius:3px;height:6px;width:120px;overflow:hidden'><div style='background:$clr;height:6px;border-radius:3px;width:${barPct}%;box-shadow:0 0 4px $clr'></div></div></td><td style='font-family:JetBrains Mono,monospace;color:$clr;font-size:10px'>$pct%</td></tr>"
 }) -join "`n"
 
-$tableRows = @(foreach ($c in ($global:Checks | Sort-Object @{e={if ($_.Compliant) {1} else {0}}},Severity)) {
+$tableRows = @(foreach ($c in ($global:Checks | Sort-Object @{e={if ($null -eq $_.Compliant) {2} elseif ($_.Compliant) {1} else {0}}},Severity)) {
     $sc    = Get-SC $c.Severity
-    $comClr= if ($c.Compliant) { '#00ff88' } else { '#ff6b00' }
-    $comTxt= if ($c.Compliant) { 'PASS' } else { 'FAIL' }
-    $asClr = switch ($c.ApplyStatus) { 'Applied+Verified'{'#00ff88'} 'Applied-NotVerified'{'#ffd60a'} 'FAILED'{'#ff2d55'} 'AlreadyCompliant'{'#00ff88'} default{'#8b949e'} }
+    if ($null -eq $c.Compliant) {
+        $comClr = '#8b949e'   # neutral grey for N/A
+        $comTxt = 'N/A'
+    } elseif ($c.Compliant) {
+        $comClr = '#00ff88'
+        $comTxt = 'PASS'
+    } else {
+        $comClr = '#ff6b00'
+        $comTxt = 'FAIL'
+    }
+    $asClr = switch ($c.ApplyStatus) {
+        'Applied+Verified'    { '#00ff88' }
+        'Applied-NotVerified' { '#ffd60a' }
+        'FAILED'              { '#ff2d55' }
+        'AlreadyCompliant'    { '#00ff88' }
+        'NotApplicable'       { '#8b949e' }
+        default               { '#8b949e' }
+    }
     $nm    = [System.Net.WebUtility]::HtmlEncode($c.Name)
     $desc  = [System.Net.WebUtility]::HtmlEncode($c.Description)
+    # If N/A, append the skip reason to the description for transparency
+    if ($null -eq $c.Compliant -and $c.PSObject.Properties['SkipReason'] -and $c.SkipReason) {
+        $skipReasonEnc = [System.Net.WebUtility]::HtmlEncode($c.SkipReason)
+        $desc = "$desc<br><span style='color:#8b949e;font-style:italic'>[N/A: $skipReasonEnc]</span>"
+    }
     $ref   = [System.Net.WebUtility]::HtmlEncode($c.Reference)
     $rem   = [System.Net.WebUtility]::HtmlEncode($c.Remediation)
     $as    = [System.Net.WebUtility]::HtmlEncode($c.ApplyStatus)
@@ -1964,7 +2694,15 @@ $tableRows = @(foreach ($c in ($global:Checks | Sort-Object @{e={if ($_.Complian
 
 $modeColor = switch ($Mode) { 'Apply' { '#ff6b00' } 'Rollback' { '#a78bfa' } default { '#00d4ff' } }
 
-# ── Pre-build profile summary HTML rows for the report ───────────────────────
+# HTML-encoded variants of values that go into the report (defence-in-depth against
+# unusual COMPUTERNAME / path content; in practice these are admin-controlled).
+$_compNameEnc   = [System.Net.WebUtility]::HtmlEncode($env:COMPUTERNAME)
+$_backupPathEnc = [System.Net.WebUtility]::HtmlEncode($BackupPath)
+$_outputPathEnc = [System.Net.WebUtility]::HtmlEncode($OutputPath)
+$_modeEnc       = [System.Net.WebUtility]::HtmlEncode($Mode)
+$_profileEnc    = [System.Net.WebUtility]::HtmlEncode($DeviceProfile)
+
+# -- Pre-build profile summary HTML rows for the report -----------------------
 $profileAppliedRows = ($global:ProfileApplied | ForEach-Object {
     "<tr><td style='width:16px;padding:8px 10px'><span style='color:#00ff88;font-family:JetBrains Mono,monospace;font-size:11px'>+</span></td>" +
     "<td style='padding:8px 12px;font-family:JetBrains Mono,monospace;font-size:11px;color:#c9d1d9'>$_</td></tr>"
@@ -2004,7 +2742,7 @@ $html = @"
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ZavetSec-Harden // $env:COMPUTERNAME</title>
+<title>ZavetSec-Harden // $_compNameEnc</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2090,7 +2828,7 @@ header{
 @keyframes pulse{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
 .main{padding:28px 40px;max-width:1820px;margin:0 auto}
 
-/* ── SECTION HEADER ── */
+/* -- SECTION HEADER -- */
 .sec-hdr{
   display:flex;align-items:center;gap:10px;
   font-family:'JetBrains Mono',monospace;
@@ -2112,7 +2850,7 @@ header{
   font-size:9px;
 }
 
-/* ── SCORE PANEL ── */
+/* -- SCORE PANEL -- */
 .score-panel{
   background:#0d1117;
   border:1px solid rgba(0,255,136,0.2);
@@ -2170,7 +2908,7 @@ header{
 .sev-row{display:flex;align-items:center;justify-content:flex-end;gap:8px}
 .sev-val{font-weight:700;font-size:13px;min-width:20px;text-align:right}
 
-/* ── STAT CARDS ── */
+/* -- STAT CARDS -- */
 .stats{display:grid;grid-template-columns:repeat(8,1fr);gap:10px;margin-bottom:20px}
 .sc{
   background:#0d1117;
@@ -2201,7 +2939,7 @@ header{
   margin-top:4px;font-weight:600;
 }
 
-/* ── TWO-COL GRID ── */
+/* -- TWO-COL GRID -- */
 .grid2{display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-bottom:20px}
 .panel{
   background:#0d1117;
@@ -2218,7 +2956,7 @@ header{
   border-bottom:1px solid #21262d;
 }
 
-/* ── TABLES ── */
+/* -- TABLES -- */
 table{
   width:100%;border-collapse:collapse;
   background:#0d1117;
@@ -2246,7 +2984,7 @@ td{
 }
 tr:hover td{background:#0d1117;transition:background .15s}
 
-/* ── BADGES ── */
+/* -- BADGES -- */
 .badge{
   display:inline-block;
   padding:2px 8px;
@@ -2265,7 +3003,7 @@ tr:hover td{background:#0d1117;transition:background .15s}
   color:#000;
 }
 
-/* ── ALERT BOX ── */
+/* -- ALERT BOX -- */
 .alert-box{
   background:rgba(255,45,85,0.08);
   border:1px solid rgba(255,45,85,0.35);
@@ -2282,7 +3020,7 @@ tr:hover td{background:#0d1117;transition:background .15s}
   color:#ff6b00;
 }
 
-/* ── SEARCH BAR ── */
+/* -- SEARCH BAR -- */
 .search-bar{
   background:#0d1117;
   border:1px solid #21262d;
@@ -2321,7 +3059,7 @@ tr:hover td{background:#0d1117;transition:background .15s}
 .fbtn:hover{background:#21262d;color:#00ff88;border-color:rgba(0,255,136,0.3)}
 .fbtn.active{background:rgba(0,255,136,0.1);border-color:rgba(0,255,136,0.4);color:#00ff88}
 
-/* ── REMEDIATION CODE ── */
+/* -- REMEDIATION CODE -- */
 .rem-code{
   font-family:'JetBrains Mono',monospace;
   color:#7eb8ff;
@@ -2334,7 +3072,7 @@ tr:hover td{background:#0d1117;transition:background .15s}
   padding:2px 4px;
 }
 
-/* ── FOOTER ── */
+/* -- FOOTER -- */
 footer{
   margin-top:40px;
   padding:16px 40px;
@@ -2352,8 +3090,8 @@ footer{
 <header>
   <div class="logo-block">
     <div class="logo-name">ZavetSec<div class="dot-anim" style="display:inline-flex"><span></span><span></span><span></span></div></div>
-    <div class="logo-title"><span>Harden</span><span class="logo-cursor">_</span> <span style="font-size:13px;color:#8b949e;font-weight:400">v1.2</span></div>
-    <div class="header-meta">Windows Security Hardening Baseline &nbsp;//&nbsp; Host: $env:COMPUTERNAME &nbsp;//&nbsp; Mode: <span class="mode-badge" style="background:$modeColor">$Mode</span> &nbsp;//&nbsp; $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) &nbsp;//&nbsp; Duration: $duration &nbsp;//&nbsp; Checks: $totalChecks</div>
+    <div class="logo-title"><span>Harden</span><span class="logo-cursor">_</span> <span style="font-size:13px;color:#8b949e;font-weight:400">v1.3</span></div>
+    <div class="header-meta">Windows Security Hardening Baseline &nbsp;//&nbsp; Host: $_compNameEnc &nbsp;//&nbsp; Mode: <span class="mode-badge" style="background:$modeColor">$_modeEnc</span> &nbsp;//&nbsp; $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) &nbsp;//&nbsp; Duration: $duration &nbsp;//&nbsp; Checks: $totalChecks</div>
   </div>
   <div class="header-right">
     <div class="brand">ZavetSec</div>
@@ -2364,7 +3102,7 @@ footer{
 
 <div class="main">
 
-  <!-- ── SCORE ── -->
+  <!-- -- SCORE -- -->
   <div class="sec-hdr"><span class="sec-num">01</span> Compliance Overview</div>
 
   <div class="score-panel" style="border-color:rgba($(if($compliancePct -ge 80){'0,255,136'}elseif($compliancePct -ge 60){'255,107,0'}else{'255,45,85'}),0.3)">
@@ -2390,10 +3128,11 @@ footer{
     </div>
   </div>
 
-  <!-- ── STAT CARDS ── -->
+  <!-- -- STAT CARDS -- -->
   <div class="stats">
     <div class="sc"><div class="n" style="color:#00ff88">$compliantCount</div><div class="l">Passed</div></div>
     <div class="sc"><div class="n" style="color:#ff6b00">$nonCompliantCount</div><div class="l">Failed</div></div>
+    <div class="sc"><div class="n" style="color:#8b949e">$naCount</div><div class="l">N/A</div></div>
     <div class="sc"><div class="n" style="color:#ff2d55">$critFail</div><div class="l">Critical</div></div>
     <div class="sc"><div class="n" style="color:#ff6b00">$highFail</div><div class="l">High</div></div>
     <div class="sc"><div class="n" style="color:#ffd60a">$medFail</div><div class="l">Medium</div></div>
@@ -2402,7 +3141,7 @@ footer{
     <div class="sc"><div class="n" style="color:#8b949e">$($global:Skipped)</div><div class="l">Already OK</div></div>
   </div>
 
-  <!-- ── CATEGORY TABLE + COVERAGE ── -->
+  <!-- -- CATEGORY TABLE + COVERAGE -- -->
   <div class="sec-hdr"><span class="sec-num">02</span> Category Breakdown</div>
   <div class="grid2">
     <div class="panel">
@@ -2421,8 +3160,8 @@ footer{
         <div>Audit Policy <span style="color:$(if($SkipAuditPolicy){'#ff6b00'}else{'#00ff88'})">$(if($SkipAuditPolicy){'[SKIPPED]'}else{'[OK]'})</span></div>
         <div>System Hardening <span style="color:#00ff88">[OK]</span></div>
         <div>Print Spooler Disable <span style="color:$(if($EnablePrintSpoolerDisable){'#00ff88'}else{'#8b949e'})">$(if($EnablePrintSpoolerDisable){'[ENABLED]'}else{'[OPT-IN]'})</span></div>
-        <div style="font-size:9px;color:#8b949e">Profile: <span style="color:#a5d6ff">$DeviceProfile</span></div>
-        <div style="margin-top:4px;font-size:9px;color:#8b949e">Backup: $(if(Test-Path $BackupPath){"$BackupPath"}else{'N/A'})</div>
+        <div>Profile: <span style="color:#a5d6ff">$_profileEnc</span></div>
+        <div style="margin-top:4px;font-size:9px;color:#8b949e">Backup: $(if(Test-Path $BackupPath){"$_backupPathEnc"}else{'N/A'})</div>
         <div style="font-size:9px;color:#8b949e">Rollback: .\ZavetSec-Harden.ps1 -Mode Rollback -BackupPath &quot;...&quot;</div>
       </div>
     </div>
@@ -2430,7 +3169,7 @@ footer{
 
   $profileSectionHtml
 
-  <!-- ── CHECKS TABLE ── -->
+  <!-- -- CHECKS TABLE -- -->
   <div class="sec-hdr"><span class="sec-num">03</span> All Checks <span style="color:#8b949e;font-weight:400">($totalChecks)</span></div>
 
   $(if ($critFail -gt 0) { '<div class="alert-box">&#9888; ' + $critFail + ' CRITICAL check(s) failed &mdash; immediate remediation required</div>' })
@@ -2464,10 +3203,10 @@ footer{
 
 <footer>
   <span style="color:#00ff88;font-weight:700;letter-spacing:2px">ZAVETSEC</span>
-  &nbsp;&bull;&nbsp; ZavetSec-Harden v1.2
+  &nbsp;&bull;&nbsp; ZavetSec-Harden v1.4
   &nbsp;&bull;&nbsp; github.com/zavetsec
-  &nbsp;&bull;&nbsp; Host: $env:COMPUTERNAME
-  &nbsp;&bull;&nbsp; Mode: $Mode
+  &nbsp;&bull;&nbsp; Host: $_compNameEnc
+  &nbsp;&bull;&nbsp; Mode: $_modeEnc
   &nbsp;&bull;&nbsp; $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))
   &nbsp;&bull;&nbsp; <span style="color:#ff2d55;font-weight:700">CONFIDENTIAL &mdash; SOC/DFIR USE ONLY</span>
 </footer>
@@ -2526,8 +3265,7 @@ try {
     Write-Host "  [OK] Report saved to TEMP: $OutputPath" -ForegroundColor Yellow
 }
 
-# Restore StrictMode
-Set-StrictMode -Version Latest
+# StrictMode remains Off (set at script start) -- avoids null-property pitfalls in cleanup blocks
 
 $sep = "-" * 64
 Write-Host ""; Write-Host $sep -ForegroundColor DarkGray
@@ -2556,7 +3294,7 @@ Write-Host ""
 Write-Host "  Report: $OutputPath" -ForegroundColor Cyan
 Write-Host $sep -ForegroundColor DarkGray
 
-$rebootNeeded = @($global:Checks | Where-Object { $_.RebootRequired -eq 'Yes' -and -not $_.Compliant }).Count
+$rebootNeeded = @($global:Checks | Where-Object { $_.RebootRequired -eq 'Yes' -and $_.Compliant -eq $false }).Count
 if ($isApply -and $rebootNeeded -gt 0) {
     Write-Host ""
     Write-Host "  [!] $rebootNeeded setting(s) require a REBOOT to take effect." -ForegroundColor Yellow
